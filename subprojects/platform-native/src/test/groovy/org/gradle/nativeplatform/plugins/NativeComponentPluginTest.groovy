@@ -16,6 +16,7 @@
 
 package org.gradle.nativeplatform.plugins
 
+import org.gradle.api.Task
 import org.gradle.api.tasks.TaskDependencyMatchers
 import org.gradle.model.ModelMap
 import org.gradle.nativeplatform.NativeExecutableSpec
@@ -41,6 +42,10 @@ class NativeComponentPluginTest extends Specification {
         project.modelRegistry.find("binaries", modelMap(BinarySpec))
     }
 
+    ModelMap<Task> realizeTasks() {
+        project.modelRegistry.find 'tasks', modelMap(Task)
+    }
+
     def "creates link and install task for executable"() {
         when:
         project.model {
@@ -49,7 +54,7 @@ class NativeComponentPluginTest extends Specification {
             }
         }
 
-        project.tasks.realize()
+        realizeTasks()
         def binaries = realizeBinaries()
         project.bindAllModelRules()
 
@@ -79,7 +84,7 @@ class NativeComponentPluginTest extends Specification {
             }
         }
 
-        project.tasks.realize()
+        realizeTasks()
         def binaries = realizeBinaries()
         project.bindAllModelRules()
 
