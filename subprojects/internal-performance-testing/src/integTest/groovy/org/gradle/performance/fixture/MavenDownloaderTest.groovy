@@ -16,12 +16,12 @@
 
 package org.gradle.performance.fixture
 
-import org.gradle.util.Requires
-import org.gradle.util.TestPrecondition
-import org.junit.Rule
-import org.junit.rules.TemporaryFolder
-import spock.lang.Specification
-import spock.lang.Unroll
+import Requires
+import TestPrecondition
+import Rule
+import TemporaryFolder
+import Specification
+import Unroll
 
 class MavenDownloaderTest extends Specification {
 

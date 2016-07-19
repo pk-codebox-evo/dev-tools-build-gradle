@@ -16,7 +16,7 @@
 
 package org.gradle.performance.fixture
 
-import org.gradle.performance.ResultSpecification
+import ResultSpecification
 import org.gradle.performance.measure.DataAmount
 import org.gradle.performance.measure.Duration
 
