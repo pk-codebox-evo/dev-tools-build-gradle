@@ -18,13 +18,10 @@ package org.gradle.integtests.tooling.r30
 
 import org.gradle.integtests.tooling.fixture.TargetGradleVersion
 import org.gradle.integtests.tooling.fixture.ToolingApiSpecification
-import org.gradle.integtests.tooling.fixture.ToolingApiVersion
 import org.gradle.test.fixtures.maven.MavenFileRepository
-import org.gradle.tooling.model.eclipse.EclipseExternalDependency
 import org.gradle.tooling.model.eclipse.EclipseProject
 
-@ToolingApiVersion('current')
-@TargetGradleVersion('current')
+@TargetGradleVersion('>=3.0')
 class ToolingApiEclipseModelCustomLibrarySourceAndJavadocCrossVersionSpec extends ToolingApiSpecification {
 
     def "Custom source and javadoc location"() {
@@ -54,8 +51,8 @@ class ToolingApiEclipseModelCustomLibrarySourceAndJavadocCrossVersionSpec extend
                     file {
                         whenMerged { classpath ->
                             def lib = classpath.entries.find { it.path.contains('example-lib') }
-                            lib.javadocPath = classpath.fileReference('$customJavadocPath')
-                            lib.sourcePath  = classpath.fileReference('$customSourcePath')
+                            lib.javadocPath = fileReference('$customJavadocPath')
+                            lib.sourcePath  = fileReference('$customSourcePath')
                         }
                     }
                 }
@@ -63,8 +60,8 @@ class ToolingApiEclipseModelCustomLibrarySourceAndJavadocCrossVersionSpec extend
         """
 
         when:
-        EclipseProject project = loadToolingModel(EclipseProject)
-        EclipseExternalDependency dependency = project.classpath[0]
+        def project = loadToolingModel(EclipseProject)
+        def dependency = project.classpath[0]
 
         then:
         dependency.source == customSource

@@ -24,24 +24,26 @@ import org.gradle.api.GradleException;
 import org.gradle.api.UncheckedIOException;
 import org.gradle.api.file.FileVisitDetails;
 import org.gradle.api.file.FileVisitor;
-import org.gradle.api.internal.file.collections.DirectoryFileTree;
+import org.gradle.api.internal.file.collections.DirectoryFileTreeFactory;
 import org.gradle.internal.ErroringAction;
 import org.gradle.internal.IoActions;
 import org.gradle.internal.UncheckedException;
 import org.gradle.internal.installation.GradleRuntimeShadedJarDetector;
+import org.gradle.internal.io.StreamByteBuffer;
 import org.gradle.internal.logging.progress.ProgressLogger;
 import org.gradle.internal.logging.progress.ProgressLoggerFactory;
 import org.gradle.internal.progress.PercentageProgressFormatter;
 import org.gradle.util.GFileUtils;
+import org.gradle.util.GUtil;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.objectweb.asm.FieldVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.commons.ClassRemapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
@@ -52,8 +54,12 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -62,23 +68,27 @@ import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
 
 class RuntimeShadedJarCreator {
+
+    public static final int ADDITIONAL_PROGRESS_STEPS = 2;
+
     private static final Logger LOGGER = LoggerFactory.getLogger(RuntimeShadedJarCreator.class);
 
     private static final int BUFFER_SIZE = 8192;
     private static final String SERVICES_DIR_PREFIX = "META-INF/services/";
-    private static final int ADDITIONAL_PROGRESS_STEPS = 2;
     private static final String CLASS_DESC = "Ljava/lang/Class;";
 
     private final ProgressLoggerFactory progressLoggerFactory;
     private final ImplementationDependencyRelocator remapper;
+    private final DirectoryFileTreeFactory directoryFileTreeFactory;
 
-    public RuntimeShadedJarCreator(ProgressLoggerFactory progressLoggerFactory, ImplementationDependencyRelocator remapper) {
+    public RuntimeShadedJarCreator(ProgressLoggerFactory progressLoggerFactory, ImplementationDependencyRelocator remapper, DirectoryFileTreeFactory directoryFileTreeFactory) {
         this.progressLoggerFactory = progressLoggerFactory;
         this.remapper = remapper;
+        this.directoryFileTreeFactory = directoryFileTreeFactory;
     }
 
     public void create(final File outputJar, final Iterable<? extends File> files) {
-        LOGGER.info("Generating gradleApi JAR file: " + outputJar.getAbsolutePath());
+        LOGGER.info("Generating JAR file: " + outputJar.getAbsolutePath());
         ProgressLogger progressLogger = progressLoggerFactory.newOperation(RuntimeShadedJarCreator.class);
         progressLogger.setDescription("Gradle JARs generation");
         progressLogger.setLoggingHeader("Generating JAR file '" + outputJar.getName() + "'");
@@ -92,24 +102,27 @@ class RuntimeShadedJarCreator {
     }
 
     private void createFatJar(final File outputJar, final Iterable<? extends File> files, final ProgressLogger progressLogger) {
-        final File tmpFile;
-
-        try {
-            tmpFile = File.createTempFile(outputJar.getName(), ".tmp");
-            tmpFile.deleteOnExit();
-        } catch (IOException e) {
-            throw UncheckedException.throwAsUncheckedException(e);
-        }
+        final File tmpFile = tempFileFor(outputJar);
 
         IoActions.withResource(openJarOutputStream(tmpFile), new ErroringAction<ZipOutputStream>() {
             @Override
             protected void doExecute(ZipOutputStream jarOutputStream) throws Exception {
-                processFiles(jarOutputStream, files, new byte[BUFFER_SIZE], new HashSet<String>(), new HashMap<String, List<String>>(), progressLogger);
+                processFiles(jarOutputStream, files, new byte[BUFFER_SIZE], new HashSet<String>(), new LinkedHashMap<String, List<String>>(), progressLogger);
                 jarOutputStream.finish();
             }
         });
 
         GFileUtils.moveFile(tmpFile, outputJar);
+    }
+
+    private File tempFileFor(File outputJar) {
+        try {
+            final File tmpFile = File.createTempFile(outputJar.getName(), ".tmp");
+            tmpFile.deleteOnExit();
+            return tmpFile;
+        } catch (IOException e) {
+            throw UncheckedException.throwAsUncheckedException(e);
+        }
     }
 
     private ZipOutputStream openJarOutputStream(File outputJar) {
@@ -135,14 +148,14 @@ class RuntimeShadedJarCreator {
                 processDirectory(outputStream, file, buffer, seenPaths, services);
             }
 
-            progressFormatter.incrementAndGetProgress();
+            progressFormatter.increment();
         }
 
         writeServiceFiles(outputStream, services);
-        progressFormatter.incrementAndGetProgress();
+        progressLogger.progress(progressFormatter.incrementAndGetProgress());
 
         writeIdentifyingMarkerFile(outputStream);
-        progressFormatter.incrementAndGetProgress();
+        progressLogger.progress(progressFormatter.incrementAndGetProgress());
     }
 
     private void writeServiceFiles(ZipOutputStream outputStream, Map<String, List<String>> services) throws IOException {
@@ -157,32 +170,46 @@ class RuntimeShadedJarCreator {
     }
 
     private void processDirectory(final ZipOutputStream outputStream, File file, final byte[] buffer, final HashSet<String> seenPaths, final Map<String, List<String>> services) {
-        new DirectoryFileTree(file).visit(new FileVisitor() {
+        final List<FileVisitDetails> fileVisitDetails = new ArrayList<FileVisitDetails>();
+        directoryFileTreeFactory.create(file).visit(new FileVisitor() {
             @Override
             public void visitDir(FileVisitDetails dirDetails) {
-                try {
-                    ZipEntry zipEntry = new ZipEntry(dirDetails.getPath() + "/");
-                    processEntry(outputStream, null, zipEntry, buffer, seenPaths, services);
-                } catch (IOException e) {
-                    throw new UncheckedIOException(e);
-                }
+                fileVisitDetails.add(dirDetails);
             }
 
             @Override
             public void visitFile(FileVisitDetails fileDetails) {
-                try {
-                    ZipEntry zipEntry = new ZipEntry(fileDetails.getPath());
-                    InputStream inputStream = fileDetails.open();
+                fileVisitDetails.add(fileDetails);
+            }
+        });
+
+        // We need to sort here since the file order obtained from the filesystem
+        // can change between machines and we always want to have the same shaded jars.
+        Collections.sort(fileVisitDetails, new Comparator<FileVisitDetails>() {
+            @Override
+            public int compare(FileVisitDetails o1, FileVisitDetails o2) {
+                return o1.getPath().compareTo(o2.getPath());
+            }
+        });
+
+        for (FileVisitDetails details : fileVisitDetails) {
+            try {
+                if (details.isDirectory()) {
+                    ZipEntry zipEntry = newZipEntryWithFixedTime(details.getPath() + "/");
+                    processEntry(outputStream, null, zipEntry, buffer, seenPaths, services);
+                } else {
+                    ZipEntry zipEntry = newZipEntryWithFixedTime(details.getPath());
+                    InputStream inputStream = details.open();
                     try {
                         processEntry(outputStream, inputStream, zipEntry, buffer, seenPaths, services);
                     } finally {
                         inputStream.close();
                     }
-                } catch (IOException e) {
-                    throw new UncheckedIOException(e);
                 }
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
             }
-        });
+        }
     }
 
     private void processJarFile(final ZipOutputStream outputStream, File file, final byte[] buffer, final Set<String> seenPaths, final Map<String, List<String>> services) throws IOException {
@@ -201,6 +228,10 @@ class RuntimeShadedJarCreator {
     private void processEntry(ZipOutputStream outputStream, InputStream inputStream, ZipEntry zipEntry, byte[] buffer, final Set<String> seenPaths, Map<String, List<String>> services) throws IOException {
         String name = zipEntry.getName();
         if (zipEntry.isDirectory() || name.equals("META-INF/MANIFEST.MF")) {
+            return;
+        }
+        // Remove license files that cause collisions between a LICENSE file and a license/ directory.
+        if (name.startsWith("LICENSE") || name.startsWith("license")) {
             return;
         }
         if (!name.startsWith(SERVICES_DIR_PREFIX) && !seenPaths.add(name)) {
@@ -252,10 +283,10 @@ class RuntimeShadedJarCreator {
     }
 
     private void copyEntry(ZipOutputStream outputStream, InputStream inputStream, ZipEntry zipEntry, byte[] buffer) throws IOException {
-        ByteArrayOutputStream bos = new ByteArrayOutputStream(1024);
-        pipe(inputStream, bos, buffer);
+        StreamByteBuffer streamByteBuffer = new StreamByteBuffer(Math.max(Math.min((int) zipEntry.getSize(), 1024 * 1024), 4096)); // min chunk size 4kB, max size 1MB
+        streamByteBuffer.readFully(inputStream);
         String originalName = zipEntry.getName();
-        byte[] resource = bos.toByteArray();
+        byte[] resource = streamByteBuffer.readAsByteArray();
 
         int i = originalName.lastIndexOf("/");
         String path = i == -1 ? null : originalName.substring(0, i);
@@ -274,16 +305,22 @@ class RuntimeShadedJarCreator {
     }
 
     private void writeResourceEntry(ZipOutputStream outputStream, InputStream inputStream, byte[] buffer, String resourceFileName) throws IOException {
-        outputStream.putNextEntry(new ZipEntry(resourceFileName));
+        outputStream.putNextEntry(newZipEntryWithFixedTime(resourceFileName));
         pipe(inputStream, outputStream, buffer);
         outputStream.closeEntry();
     }
 
     private void writeEntry(ZipOutputStream outputStream, String name, byte[] content) throws IOException {
-        ZipEntry zipEntry = new ZipEntry(name);
+        ZipEntry zipEntry = newZipEntryWithFixedTime(name);
         outputStream.putNextEntry(zipEntry);
         outputStream.write(content);
         outputStream.closeEntry();
+    }
+
+    private ZipEntry newZipEntryWithFixedTime(String name) {
+        ZipEntry entry = new ZipEntry(name);
+        entry.setTime(GUtil.CONSTANT_TIME_FOR_ZIP_ENTRIES);
+        return entry;
     }
 
     private void processClassFile(ZipOutputStream outputStream, InputStream inputStream, ZipEntry zipEntry, byte[] buffer) throws IOException {

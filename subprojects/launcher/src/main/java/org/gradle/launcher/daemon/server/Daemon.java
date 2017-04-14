@@ -20,7 +20,6 @@ import org.gradle.api.logging.Logging;
 import org.gradle.internal.concurrent.CompositeStoppable;
 import org.gradle.internal.concurrent.ExecutorFactory;
 import org.gradle.internal.concurrent.Stoppable;
-import org.gradle.internal.event.ListenerBroadcast;
 import org.gradle.internal.event.ListenerManager;
 import org.gradle.internal.remote.Address;
 import org.gradle.launcher.daemon.context.DaemonContext;
@@ -32,6 +31,7 @@ import org.gradle.launcher.daemon.server.expiry.DaemonExpirationListener;
 import org.gradle.launcher.daemon.server.expiry.DaemonExpirationResult;
 import org.gradle.launcher.daemon.server.expiry.DaemonExpirationStatus;
 import org.gradle.launcher.daemon.server.expiry.DaemonExpirationStrategy;
+import org.gradle.process.internal.shutdown.ShutdownHookActionRegister;
 
 import java.security.SecureRandom;
 import java.util.Date;
@@ -65,7 +65,7 @@ public class Daemon implements Stoppable {
     private final Lock lifecycleLock = new ReentrantLock();
 
     private Address connectorAddress;
-    private DomainRegistryUpdater registryUpdater;
+    private DaemonRegistryUpdater registryUpdater;
     private DefaultIncomingConnectionHandler connectionHandler;
 
     /**
@@ -74,13 +74,13 @@ public class Daemon implements Stoppable {
      * @param connector The provider of server connections for this daemon
      * @param daemonRegistry The registry that this daemon should advertise itself in
      */
-    public Daemon(DaemonServerConnector connector, DaemonRegistry daemonRegistry, DaemonContext daemonContext, DaemonCommandExecuter commandExecuter, ExecutorFactory executorFactory, ScheduledExecutorService scheduledExecutorService, ListenerManager listenerManager) {
+    public Daemon(DaemonServerConnector connector, DaemonRegistry daemonRegistry, DaemonContext daemonContext, DaemonCommandExecuter commandExecuter, ExecutorFactory executorFactory, ListenerManager listenerManager) {
         this.connector = connector;
         this.daemonRegistry = daemonRegistry;
         this.daemonContext = daemonContext;
         this.commandExecuter = commandExecuter;
         this.executorFactory = executorFactory;
-        this.scheduledExecutorService = scheduledExecutorService;
+        this.scheduledExecutorService = executorFactory.createScheduled("Daemon periodic checks", 1);
         this.listenerManager = listenerManager;
     }
 
@@ -118,9 +118,9 @@ public class Daemon implements Stoppable {
             byte[] token = new byte[16];
             secureRandom.nextBytes(token);
 
-            registryUpdater = new DomainRegistryUpdater(daemonRegistry, daemonContext, token);
+            registryUpdater = new DaemonRegistryUpdater(daemonRegistry, daemonContext, token);
 
-            Runtime.getRuntime().addShutdownHook(new Thread() {
+            ShutdownHookActionRegister.addAction(new Runnable() {
                 @Override
                 public void run() {
                     try {
@@ -145,13 +145,20 @@ public class Daemon implements Stoppable {
                 }
             };
 
+            Runnable onCancelCommand = new Runnable() {
+                @Override
+                public void run() {
+                    registryUpdater.onCancel();
+                }
+            };
+
             // Start the pipeline in reverse order:
             // 1. mark daemon as running
             // 2. start handling incoming commands
             // 3. start accepting incoming connections
             // 4. advertise presence in registry
 
-            stateCoordinator = new DaemonStateCoordinator(executorFactory, onStartCommand, onFinishCommand);
+            stateCoordinator = new DaemonStateCoordinator(executorFactory, onStartCommand, onFinishCommand, onCancelCommand);
             connectionHandler = new DefaultIncomingConnectionHandler(commandExecuter, daemonContext, stateCoordinator, executorFactory, token);
             Runnable connectionErrorHandler = new Runnable() {
                 @Override
@@ -246,12 +253,12 @@ public class Daemon implements Stoppable {
 
     private static class DaemonExpirationPeriodicCheck implements Runnable {
         private final DaemonExpirationStrategy expirationStrategy;
-        private final ListenerBroadcast<DaemonExpirationListener> listenerBroadcast;
+        private final DaemonExpirationListener listenerBroadcast;
         private final Lock lock = new ReentrantLock();
 
         DaemonExpirationPeriodicCheck(DaemonExpirationStrategy expirationStrategy, ListenerManager listenerManager) {
             this.expirationStrategy = expirationStrategy;
-            this.listenerBroadcast = listenerManager.createAnonymousBroadcaster(DaemonExpirationListener.class);
+            this.listenerBroadcast = listenerManager.getBroadcaster(DaemonExpirationListener.class);
         }
 
         @Override
@@ -261,7 +268,7 @@ public class Daemon implements Stoppable {
                     LOGGER.debug("DaemonExpirationPeriodicCheck running");
                     final DaemonExpirationResult result = expirationStrategy.checkExpiration();
                     if (result.getStatus() != DO_NOT_EXPIRE) {
-                        listenerBroadcast.getSource().onExpirationEvent(result);
+                        listenerBroadcast.onExpirationEvent(result);
                     }
                 } catch (Throwable t) {
                     LOGGER.error("Problem in daemon expiration check", t);
@@ -280,9 +287,9 @@ public class Daemon implements Stoppable {
 
     private static class DefaultDaemonExpirationListener implements DaemonExpirationListener {
         private final DaemonStateControl stateControl;
-        private final DomainRegistryUpdater registryUpdater;
+        private final DaemonRegistryUpdater registryUpdater;
 
-        public DefaultDaemonExpirationListener(DaemonStateControl stateControl, DomainRegistryUpdater registryUpdater) {
+        public DefaultDaemonExpirationListener(DaemonStateControl stateControl, DaemonRegistryUpdater registryUpdater) {
             this.stateControl = stateControl;
             this.registryUpdater = registryUpdater;
         }

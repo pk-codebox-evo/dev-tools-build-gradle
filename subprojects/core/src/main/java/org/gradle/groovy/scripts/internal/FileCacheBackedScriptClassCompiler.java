@@ -20,7 +20,7 @@ import com.google.common.io.Files;
 import groovy.lang.Script;
 import org.codehaus.groovy.ast.ClassNode;
 import org.gradle.api.Action;
-import org.gradle.api.internal.changedetection.state.FileSnapshotter;
+import org.gradle.api.internal.hash.FileHasher;
 import org.gradle.api.internal.initialization.loadercache.ClassLoaderCache;
 import org.gradle.api.internal.initialization.loadercache.ClassLoaderId;
 import org.gradle.cache.CacheRepository;
@@ -29,7 +29,7 @@ import org.gradle.cache.PersistentCache;
 import org.gradle.groovy.scripts.ScriptSource;
 import org.gradle.internal.UncheckedException;
 import org.gradle.internal.classloader.ClassLoaderHierarchyHasher;
-import org.gradle.internal.hash.HashValue;
+import org.gradle.internal.hash.HashUtil;
 import org.gradle.internal.logging.progress.ProgressLogger;
 import org.gradle.internal.logging.progress.ProgressLoggerFactory;
 import org.gradle.model.dsl.internal.transform.RuleVisitor;
@@ -56,18 +56,18 @@ public class FileCacheBackedScriptClassCompiler implements ScriptClassCompiler, 
     private final ProgressLoggerFactory progressLoggerFactory;
     private final CacheRepository cacheRepository;
     private final CacheValidator validator;
-    private final FileSnapshotter snapshotter;
+    private final FileHasher hasher;
     private final ClassLoaderCache classLoaderCache;
     private final ClassLoaderHierarchyHasher classLoaderHierarchyHasher;
 
     public FileCacheBackedScriptClassCompiler(CacheRepository cacheRepository, CacheValidator validator, ScriptCompilationHandler scriptCompilationHandler,
-                                              ProgressLoggerFactory progressLoggerFactory, FileSnapshotter snapshotter, ClassLoaderCache classLoaderCache,
+                                              ProgressLoggerFactory progressLoggerFactory, FileHasher hasher, ClassLoaderCache classLoaderCache,
                                               ClassLoaderHierarchyHasher classLoaderHierarchyHasher) {
         this.cacheRepository = cacheRepository;
         this.validator = validator;
         this.scriptCompilationHandler = scriptCompilationHandler;
         this.progressLoggerFactory = progressLoggerFactory;
-        this.snapshotter = snapshotter;
+        this.hasher = hasher;
         this.classLoaderCache = classLoaderCache;
         this.classLoaderHierarchyHasher = classLoaderHierarchyHasher;
     }
@@ -84,9 +84,14 @@ public class FileCacheBackedScriptClassCompiler implements ScriptClassCompiler, 
             return emptyCompiledScript(classLoaderId, operation);
         }
 
-        final String sourceHash = hashFor(source);
+        HashCode sourceHashCode = hasher.hash(source.getResource());
+        final String sourceHash = HashUtil.compactStringFor(sourceHashCode);
         final String dslId = operation.getId();
-        final String classpathHash = dslId + classLoaderHierarchyHasher.getLenientHash(classLoader);
+        HashCode classLoaderHash = classLoaderHierarchyHasher.getClassLoaderHash(classLoader);
+        if (classLoaderHash == null) {
+            throw new IllegalArgumentException("Unknown classloader: " + classLoader);
+        }
+        final String classpathHash = dslId + classLoaderHash;
         final RemappingScriptSource remapped = new RemappingScriptSource(source);
 
         // Caching involves 2 distinct caches, so that 2 scripts with the same (hash, classpath) do not get compiled twice
@@ -100,24 +105,19 @@ public class FileCacheBackedScriptClassCompiler implements ScriptClassCompiler, 
             .withValidator(validator)
             .withInitializer(new ProgressReportingInitializer(progressLoggerFactory, new RemapBuildScriptsAction<M, T>(remapped, classpathHash, sourceHash, dslId, classLoader, operation, verifier, scriptBaseClass),
                 "Compiling script into cache",
-                "Compiling " + source.getFileName() + " into local build cache"))
+                "Compiling " + source.getFileName() + " into local compilation cache"))
             .open();
         remappedClassesCache.close();
 
         File remappedClassesDir = classesDir(remappedClassesCache);
         File remappedMetadataDir = metadataDir(remappedClassesCache);
 
-        return scriptCompilationHandler.loadFromDir(source, classLoader, remappedClassesDir, remappedMetadataDir, operation, scriptBaseClass, classLoaderId);
+        return scriptCompilationHandler.loadFromDir(source, sourceHashCode, classLoader, remappedClassesDir, remappedMetadataDir, operation, scriptBaseClass, classLoaderId);
     }
 
     private <T extends Script, M> CompiledScript<T, M> emptyCompiledScript(ClassLoaderId classLoaderId, CompileOperation<M> operation) {
         classLoaderCache.remove(classLoaderId);
         return new EmptyCompiledScript<T, M>(operation);
-    }
-
-    private String hashFor(ScriptSource source) {
-        HashCode hash = snapshotter.snapshot(source.getResource()).getHash();
-        return new HashValue(hash.asBytes()).asCompactString();
     }
 
     public void close() {

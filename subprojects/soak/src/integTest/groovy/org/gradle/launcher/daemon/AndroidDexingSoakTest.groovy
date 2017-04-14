@@ -16,6 +16,7 @@
 
 package org.gradle.launcher.daemon
 
+import org.gradle.api.internal.cache.HeapProportionalCacheSizer
 import org.gradle.integtests.fixtures.daemon.DaemonIntegrationSpec
 import org.gradle.soak.categories.SoakTest
 import org.gradle.util.Requires
@@ -25,6 +26,9 @@ import org.junit.experimental.categories.Category
 @Category(SoakTest)
 @Requires(TestPrecondition.NOT_WINDOWS)
 class AndroidDexingSoakTest extends DaemonIntegrationSpec {
+    public static final ANDROID_PLUGIN_VERSION = '2.3.1'
+    public static final ANDROID_BUILD_TOOLS_VERSION = '25.0.0'
+
     int buildCount
     int maxRatio
 
@@ -79,7 +83,7 @@ class AndroidDexingSoakTest extends DaemonIntegrationSpec {
 
             executer.withStackTraceChecksDisabled()
             3.times { executer.expectDeprecationWarning() }
-            executer.withBuildJvmOpts("-Xmx2560m", "-Dorg.gradle.cache.reserved=1536")
+            executer.withBuildJvmOpts("-Xmx2560m", "-D${HeapProportionalCacheSizer.CACHE_RESERVED_SYSTEM_PROPERTY}=1536")
             args('-x', 'lint')
             succeeds('clean', 'transformClassesWithDexForRelease')
             result.assertTaskNotSkipped(':transformClassesWithDexForRelease')
@@ -192,7 +196,7 @@ class AndroidDexingSoakTest extends DaemonIntegrationSpec {
 
 
                 dependencies {
-                    classpath 'com.android.tools.build:gradle:2.2.0-alpha4'
+                    classpath 'com.android.tools.build:gradle:$ANDROID_PLUGIN_VERSION'
                 }
             }
 
@@ -202,7 +206,7 @@ class AndroidDexingSoakTest extends DaemonIntegrationSpec {
 
             android {
                 compileSdkVersion 22
-                buildToolsVersion "23.0.2"
+                buildToolsVersion "$ANDROID_BUILD_TOOLS_VERSION"
 
                 defaultConfig {
                     applicationId "org.gradle.android.myapplication"

@@ -16,7 +16,10 @@
 
 package org.gradle.api.tasks
 
+import org.gradle.api.file.FileCollection
 import org.gradle.integtests.fixtures.AbstractIntegrationSpec
+import org.gradle.internal.Actions
+import spock.lang.Ignore
 import spock.lang.Issue
 import spock.lang.Unroll
 
@@ -38,7 +41,7 @@ class TaskInputPropertiesIntegrationTest extends AbstractIntegrationSpec {
         """
 
         when: fails "foo"
-        then: failure.assertHasCause("Unable to store task input properties. Property 'b' with value 'xxx")
+        then: failure.assertHasDescription("Unable to store input properties for task ':foo'. Property 'b' with value 'xxx' cannot be serialized.")
     }
 
     def "deals gracefully with not serializable contents of GStrings"() {
@@ -61,7 +64,7 @@ class TaskInputPropertiesIntegrationTest extends AbstractIntegrationSpec {
     }
 
     @Issue("https://issues.gradle.org/browse/GRADLE-3435")
-    def "task is not up-to-date after file moved between properties"() {
+    def "task is not up-to-date after file moved between input properties"() {
         (1..3).each {
             file("input${it}.txt").createNewFile()
         }
@@ -91,12 +94,17 @@ class TaskInputPropertiesIntegrationTest extends AbstractIntegrationSpec {
         succeeds "test"
 
         then:
-        skippedTasks.isEmpty()
+        executedAndNotSkipped ':test'
+
+        when:
+        succeeds "test"
+
+        then:
+        skipped ':test'
 
         // Keep the same files, but move one of them to the other property
-        buildFile.delete()
         buildFile << """
-            task test(type: TaskWithTwoFileCollectionInputs) {
+            test {
                 inputs1 = files("input1.txt")
                 inputs2 = files("input2.txt", "input3.txt")
             }
@@ -106,13 +114,19 @@ class TaskInputPropertiesIntegrationTest extends AbstractIntegrationSpec {
         succeeds "test", "--info"
 
         then:
-        skippedTasks.isEmpty()
+        executedAndNotSkipped ':test'
         outputContains "Input property 'inputs1' file ${file("input2.txt")} has been removed."
         outputContains "Input property 'inputs2' file ${file("input2.txt")} has been added."
+
+        when:
+        succeeds "test"
+
+        then:
+        skipped ':test'
     }
 
     @Issue("https://issues.gradle.org/browse/GRADLE-3435")
-    def "task is not up-to-date after swapping output directories between properties"() {
+    def "task is not up-to-date after swapping directories between output properties"() {
         file("buildSrc/src/main/groovy/TaskWithTwoOutputDirectoriesProperties.groovy") << """
             import org.gradle.api.*
             import org.gradle.api.tasks.*
@@ -138,7 +152,13 @@ class TaskInputPropertiesIntegrationTest extends AbstractIntegrationSpec {
         succeeds "test"
 
         then:
-        skippedTasks.isEmpty()
+        executedAndNotSkipped ':test'
+
+        when:
+        succeeds "test"
+
+        then:
+        skipped ':test'
 
         // Keep the same files, but move one of them to the other property
         buildFile.delete()
@@ -153,64 +173,18 @@ class TaskInputPropertiesIntegrationTest extends AbstractIntegrationSpec {
         succeeds "test", "--info"
 
         then:
-        skippedTasks.isEmpty()
-        outputContains "Output property 'outputs1' file ${file("build/output2")} has been added."
+        executedAndNotSkipped ':test'
         outputContains "Output property 'outputs1' file ${file("build/output1")} has been removed."
-        outputContains "Output property 'outputs2' file ${file("build/output1")} has been added."
-        // Note: "Output property 'outputs2' file ${file("build/output2")} has been removed." is missing
-        // due to limitation of only 3 changes printed
-    }
+        outputContains "Output property 'outputs2' file ${file("build/output2")} has been removed."
 
-    def "deprecation warning printed when @OutputFiles is used on non-Map property"() {
-        file("buildSrc/src/main/groovy/TaskWithOutputFilesProperty.groovy") << """
-            import org.gradle.api.*
-            import org.gradle.api.tasks.*
-
-            class TaskWithOutputFilesProperty extends DefaultTask {
-                @InputFiles def inputFiles = project.files()
-                @OutputFiles Set<File> outputFiles = []
-                @TaskAction void action() {}
-            }
-        """
-
-        buildFile << """
-            task test(type: TaskWithOutputFilesProperty)
-        """
-        executer.expectDeprecationWarning()
-        executer.requireGradleDistribution()
-        expect:
+        when:
         succeeds "test"
-        output.contains 'The use of the @OutputFiles annotation on non-Map properties has been deprecated and is scheduled to be removed in Gradle 4.0. ' +
-            'Please use separate properties for each file annotated with @OutputFile, ' +
-            'reorganize output files under a single output directory annotated with @OutputDirectory, ' +
-            'or change the property type to Map.'
+
+        then:
+        skipped ':test'
     }
 
-    def "deprecation warning printed when @OutputDirectories is used on non-Map property"() {
-        file("buildSrc/src/main/groovy/TaskWithOutputFilesProperty.groovy") << """
-            import org.gradle.api.*
-            import org.gradle.api.tasks.*
-
-            class TaskWithOutputDirectoriesProperty extends DefaultTask {
-                @InputFiles def inputFiles = project.files()
-                @OutputDirectories Set<File> outputDirs = []
-                @TaskAction void action() {}
-            }
-        """
-
-        buildFile << """
-            task test(type: TaskWithOutputDirectoriesProperty) {
-            }
-        """
-        executer.expectDeprecationWarning()
-        executer.requireGradleDistribution()
-        expect:
-        succeeds "test"
-        output.contains 'The use of the @OutputDirectories annotation on non-Map properties has been deprecated and is scheduled to be removed in Gradle 4.0. ' +
-            'Please use separate properties for each directory annotated with @OutputDirectory, ' +
-            'or change the property type to Map.'
-    }
-
+    @Ignore("Must fix for 4.0")
     def "no deprecation warning printed when @OutputDirectories or @OutputFiles is used on Map property"() {
         file("buildSrc/src/main/groovy/TaskWithOutputFilesProperty.groovy") << """
             import org.gradle.api.*
@@ -233,21 +207,7 @@ class TaskInputPropertiesIntegrationTest extends AbstractIntegrationSpec {
         succeeds "test"
     }
 
-    def "deprecation warning printed when TaskOutputs.files(Object...) is used"() {
-        buildFile << """
-            task test {
-                outputs.files("output.txt")
-            }
-        """
-        executer.expectDeprecationWarning()
-        executer.requireGradleDistribution()
-
-        expect:
-        succeeds "test"
-        output.contains 'The TaskOutputs.files(Object...) method has been deprecated and is scheduled to be removed in Gradle 4.0. ' +
-            'Please use the TaskOutputs.file(Object) or the TaskOutputs.dir(Object) method instead.'
-    }
-
+    @Ignore("Must fix for 4.0")
     @Unroll("deprecation warning printed when TaskInputs.#method is called")
     def "deprecation warning printed when deprecated source method is used"() {
         buildFile << """
@@ -270,6 +230,22 @@ class TaskInputPropertiesIntegrationTest extends AbstractIntegrationSpec {
         "source(Object...)" | "files(Object...)" | 'source("a", "b")'
     }
 
+    def "no deprecation warning printed when @Classpath annotation is used"() {
+        buildFile << """
+            class TaskWithClasspathProperty extends DefaultTask {
+                @Classpath @InputFiles def classpath = project.files()
+                @TaskAction void action() {}
+            }
+
+            task test(type: TaskWithClasspathProperty) {
+            }
+        """
+
+        expect:
+        succeeds "test"
+    }
+
+    @Ignore("Must fix for 4.0")
     @Unroll
     def "deprecation warning printed when inputs calls are chained"() {
         buildFile << """
@@ -307,6 +283,213 @@ class TaskInputPropertiesIntegrationTest extends AbstractIntegrationSpec {
         """
 
         expect:
-        succeeds "b" assertTasksExecuted ":a", ":b"
+        succeeds "b" assertTasksExecutedInOrder ":a", ":b"
+    }
+
+    def "task is out of date when property added"() {
+        buildFile << """
+task someTask {
+    inputs.property("a", "value1")
+    outputs.file "out"
+    doLast org.gradle.internal.Actions.doNothing() // attach an action that is not defined by the build script
+}
+"""
+        given:
+        succeeds "someTask"
+
+        when:
+        run "someTask"
+
+        then:
+        skipped(":someTask")
+
+        // add property
+        when:
+        buildFile << """
+someTask.inputs.property("b", 12)
+"""
+        and:
+        executer.withArgument("-i")
+        run "someTask"
+
+        then:
+        executedAndNotSkipped(":someTask")
+        outputContains("Input property 'b' has been added for task ':someTask'")
+
+        when:
+        run "someTask"
+
+        then:
+        skipped(":someTask")
+    }
+
+    def "task is out of date when property removed"() {
+        buildFile << """
+task someTask {
+    inputs.property("a", "value1")
+    inputs.property("b", "value2")
+    outputs.file "out"
+    doLast ${Actions.name}.doNothing() // attach an action that is not defined by the build script
+}
+"""
+        given:
+        succeeds "someTask"
+
+        when:
+        run "someTask"
+
+        then:
+        skipped(":someTask")
+
+        // add property
+        when:
+        buildFile.text = """
+task someTask {
+    inputs.property("b", "value2")
+    outputs.file "out"
+    doLast ${Actions.name}.doNothing()
+}
+"""
+        and:
+        executer.withArgument("-i")
+        run "someTask"
+
+        then:
+        executedAndNotSkipped(":someTask")
+        outputContains("Input property 'a' has been removed for task ':someTask'")
+
+        when:
+        run "someTask"
+
+        then:
+        skipped(":someTask")
+    }
+
+    @Unroll
+    def "task is out of date when property type changes"() {
+        buildFile << """
+task someTask {
+    inputs.property("a", $oldValue)
+    outputs.file "out"
+    doLast ${Actions.name}.doNothing() // attach an action that is not defined by the build script
+}
+"""
+        given:
+        succeeds "someTask"
+
+        when:
+        run "someTask"
+
+        then:
+        skipped(":someTask")
+
+        // change property type
+        when:
+        buildFile.replace(oldValue, newValue)
+
+        and:
+        executer.withArgument("-i")
+        run "someTask"
+
+        then:
+        executedAndNotSkipped(":someTask")
+        outputContains("Value of input property 'a' has changed for task ':someTask'")
+
+        when:
+        run "someTask"
+
+        then:
+        skipped(":someTask")
+
+        where:
+        oldValue             | newValue
+        "'value1'"           | "['value1']"
+        "'value1'"           | "null"
+        "null"               | "123"
+        "[123]"              | "123"
+        "false"              | "12.3"
+        "[345, 'hi'] as Set" | "[345, 'hi']"
+        "file('1')"          | "files('1')"
+        "123"                | "123L"
+        "123"                | "123 as short"
+    }
+
+    @Unroll
+    def "task can use property of type #type"() {
+        file("buildSrc/src/main/java/SomeTask.java") << """
+import org.gradle.api.DefaultTask;
+import org.gradle.api.tasks.TaskAction;
+import org.gradle.api.tasks.Input;
+import org.gradle.api.tasks.OutputDirectory;
+import org.gradle.api.tasks.Optional;
+import java.io.File;
+
+public class SomeTask extends DefaultTask {
+    public $type v;
+    @Input
+    public $type getV() { return v; }
+
+    public File d;
+    @OutputDirectory
+    public File getD() { return d; }
+    
+    @TaskAction
+    public void go() { }
+}
+"""
+
+        buildFile << """
+task someTask(type: SomeTask) {
+    v = $initialValue
+    d = file("build/out")
+}
+"""
+        given:
+        succeeds "someTask"
+
+        when:
+        run "someTask"
+
+        then:
+        skipped(":someTask")
+
+        when:
+        buildFile.replace("v = $initialValue", "v = $newValue")
+        executer.withArgument("-i")
+        run "someTask"
+
+        then:
+        executedAndNotSkipped(":someTask")
+        outputContains("Value of input property 'v' has changed for task ':someTask'")
+
+        when:
+        run "someTask"
+
+        then:
+        skipped(":someTask")
+
+        where:
+        type                             | initialValue                    | newValue
+        "String"                         | "'value 1'"                     | "'value 2'"
+        "java.io.File"                   | "file('file1')"                 | "file('file2')"
+        "boolean"                        | "true"                          | "false"
+        "Boolean"                        | "Boolean.TRUE"                  | "Boolean.FALSE"
+        "int"                            | "123"                           | "-45"
+        "Integer"                        | "123"                           | "-45"
+        "long"                           | "123"                           | "-45"
+        "Long"                           | "123"                           | "-45"
+        "short"                          | "123"                           | "-45"
+        "Short"                          | "123"                           | "-45"
+        "java.math.BigDecimal"           | "12.3"                          | "-45.432"
+        "java.math.BigInteger"           | "12"                            | "-45"
+        "java.util.List<String>"         | "['value1', 'value2']"          | "['value1']"
+        "java.util.List<String>"         | "[]"                            | "['value1', null, false, 123, 12.4, ['abc'], [true] as Set]"
+        "String[]"                       | "new String[0]"                 | "['abc'] as String[]"
+        "Object[]"                       | "[123, 'abc'] as Object[]"      | "['abc'] as String[]"
+        "java.util.Collection<String>"   | "['value1', 'value2']"          | "['value1'] as SortedSet"
+        "java.util.Set<String>"          | "['value1', 'value2'] as Set"   | "['value1'] as Set"
+        "Iterable<java.io.File>"         | "[file('1'), file('2')] as Set" | "files('1')"
+        FileCollection.name              | "files('1', '2')"               | "configurations.create('empty')"
+        "java.util.Map<String, Boolean>" | "[a: true, b: false]"           | "[a: true, b: true]"
     }
 }

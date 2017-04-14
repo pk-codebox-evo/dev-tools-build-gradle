@@ -59,6 +59,48 @@ class TestingIntegrationTest extends AbstractIntegrationSpec {
         ":test" in nonSkippedTasks
     }
 
+    def "configurest test task when debug property is set"() {
+        given:
+        buildFile << """
+            apply plugin: 'java'
+            task validate() {
+                doFirst {
+                    assert test.debug
+                }
+            }
+            test.dependsOn(validate)
+            test.enabled = false
+        """
+
+        when:
+        executer.withArgument("-Dtest.debug")
+
+        then:
+        succeeds("test")
+    }
+
+    def "configurest test task when test.single property is set"() {
+        given:
+        buildFile << """
+            apply plugin: 'java'
+            task validate() {
+                doFirst {
+                    assert test.includes  == ['**/pattern*.class'] as Set
+                    assert test.inputs.sourceFiles.empty
+                }
+            }
+            test.include 'ignoreme'
+            test.dependsOn(validate)
+            test.enabled = false
+        """
+
+        when:
+        executer.withArgument("-Dtest.single=pattern")
+
+        then:
+        succeeds("test")
+    }
+
     def "fails cleanly even if an exception is thrown that doesn't serialize cleanly"() {
         given:
         file('src/test/java/ExceptionTest.java') << """
@@ -357,5 +399,65 @@ class TestingIntegrationTest extends AbstractIntegrationSpec {
         result.testClass("TestCase").with {
             assertTestCount(1, 0, 0)
         }
+    }
+
+    def "tests are re-executed when set of candidate classes change"() {
+        given:
+        buildFile << """
+            apply plugin:'java'
+            repositories {
+                mavenCentral()
+            }
+            dependencies {
+                testCompile 'junit:junit:4.12'
+            }
+            test {
+                testLogging {
+                    events "passed", "skipped", "failed"
+                }
+            }
+        """
+
+        and:
+        file("src/test/java/FirstTest.java") << """
+            import org.junit.*;
+            public class FirstTest {
+                @Test public void test() {}
+            }
+        """
+
+        file("src/test/java/SecondTest.java") << """
+            import org.junit.*;
+            public class SecondTest {
+                @Test public void test() {}
+            }
+        """
+
+        when:
+        run "test"
+        then:
+        nonSkippedTasks.contains ":test"
+        output.contains("FirstTest > test PASSED")
+        output.contains("SecondTest > test PASSED")
+
+        when:
+        run "test"
+        then:
+        skippedTasks.contains ":test"
+
+        when:
+        buildFile << """
+        test {
+            filter {
+                includeTestsMatching "First*"
+            }
+        }
+        """
+        then:
+        run "test"
+        then:
+        nonSkippedTasks.contains ":test"
+        output.contains("FirstTest > test PASSED")
+        !output.contains("SecondTest > test PASSED")
     }
 }

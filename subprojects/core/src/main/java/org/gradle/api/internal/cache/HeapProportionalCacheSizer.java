@@ -17,7 +17,7 @@
 package org.gradle.api.internal.cache;
 
 public class HeapProportionalCacheSizer {
-    public static final String CACHE_RESERVED_SYSTEM_PROPERTY = "org.gradle.cache.reserved";
+    public static final String CACHE_RESERVED_SYSTEM_PROPERTY = "org.gradle.cache.reserved.mb";
     private static final int DEFAULT_SIZES_MAX_HEAP_MB = 910; // when -Xmx1024m, Runtime.maxMemory() returns about 910
     private static final int ASSUMED_USED_HEAP = 150; // assume that Gradle itself uses about 150MB heap
 
@@ -52,10 +52,11 @@ public class HeapProportionalCacheSizer {
         return scaleCacheSize(referenceValue, 100);
     }
 
-    public int scaleCacheSize(int referenceValue, int granularity) {
+    private int scaleCacheSize(int referenceValue, int granularity) {
         if (referenceValue < granularity) {
             throw new IllegalArgumentException("reference value must be larger than granularity");
         }
-        return (int) ((double) referenceValue * sizingRatio) / granularity * granularity;
+        int scaledValue = (int) ((double) referenceValue * sizingRatio) / granularity * granularity;
+        return Math.max(scaledValue, granularity);
     }
 }

@@ -16,13 +16,15 @@
 
 package org.gradle.api.tasks
 
+import org.gradle.caching.configuration.internal.DefaultBuildCacheConfiguration
 import org.gradle.integtests.fixtures.AbstractIntegrationSpec
-import org.gradle.integtests.fixtures.executer.GradleExecuter
+import org.gradle.integtests.fixtures.LocalBuildCacheFixture
+import org.gradle.integtests.fixtures.executer.GradleContextualExecuter
+import org.gradle.test.fixtures.file.TestFile
+import spock.lang.Ignore
+import spock.lang.IgnoreIf
 
-import java.util.jar.JarOutputStream
-import java.util.zip.ZipEntry
-
-class CachedTaskExecutionIntegrationTest extends AbstractIntegrationSpec {
+class CachedTaskExecutionIntegrationTest extends AbstractIntegrationSpec implements LocalBuildCacheFixture {
     public static final String ORIGINAL_HELLO_WORLD = """
             public class Hello {
                 public static void main(String... args) {
@@ -37,32 +39,157 @@ class CachedTaskExecutionIntegrationTest extends AbstractIntegrationSpec {
                 }
             }
         """
-    def cacheDir = testDirectoryProvider.createDir("task-cache")
 
     def setup() {
-        buildFile << """
+        setupProjectInDirectory(testDirectory)
+    }
+
+    private static void setupProjectInDirectory(TestFile dir, String sourceDir = "main") {
+        dir.file("build.gradle") << """
             apply plugin: "java"
         """
 
-        file("src/main/java/Hello.java") << ORIGINAL_HELLO_WORLD
-        file("src/main/resources/resource.properties") << """
+        dir.file("src/$sourceDir/java/Hello.java") << ORIGINAL_HELLO_WORLD
+        dir.file("src/$sourceDir/resources/resource.properties") << """
             test=true
         """
+
+        if (sourceDir != "main") {
+            dir.file("build.gradle") << """
+                sourceSets {
+                    main {
+                        java {
+                            srcDir "src/$sourceDir/java"
+                        }
+                        resources {
+                            srcDir "src/$sourceDir/resources"
+                        }
+                    }
+                }
+            """
+        }
     }
 
     def "no task is re-executed when inputs are unchanged"() {
         when:
-        succeedsWithCache "jar"
+        withBuildCache().succeeds "jar"
         then:
         skippedTasks.empty
 
         expect:
-        succeedsWithCache "clean"
+        withBuildCache().succeeds "clean"
 
         when:
-        succeedsWithCache "jar"
+        withBuildCache().succeeds "jar"
         then:
-        skippedTasks.containsAll ":compileJava", ":jar"
+        skippedTasks.containsAll ":compileJava"
+    }
+
+    // Note: this test only actually tests millisecond-precision when:
+    //
+    //   a) it is ran on a file system with finer-than-a-second time precision
+    //      (only Ext4 and NTFS at the time of writing),
+    //   b) the current Java implementation actually supports
+    //      finer-than-a-second precision timestamps via File.lastModified()
+    //      (only Windows Java 8 at the time of writing).
+    //
+    // Even when finer-than-a-millisecond precision would be available via
+    // Files.getLastModifiedTime(), we still restore only millisecond precision
+    // dates.
+    def "restored cached results match original timestamp with millisecond precision"() {
+        settingsFile << "rootProject.name = 'test'"
+        withBuildCache().succeeds "jar"
+        def classFile = file("build/classes/main/Hello.class")
+        def originalModificationTime = classFile.assertIsFile().lastModified()
+
+        when:
+        // We really need to sleep here, and can't use the `makeOlder()` trick,
+        // because the results are already cached with the original timestamp
+        sleep(1000)
+        withBuildCache().succeeds "clean"
+        withBuildCache().succeeds "jar"
+
+        then:
+        skippedTasks.containsAll ":compileJava"
+        classFile.lastModified() == originalModificationTime
+    }
+
+    def "cached tasks are executed with --rerun-tasks"() {
+        expect:
+        cacheDir.listFiles() as List == []
+
+        when:
+        withBuildCache().succeeds "jar"
+        def originalCacheContents = listCacheFiles()
+        def originalModificationTimes = originalCacheContents.collect { file -> TestFile.makeOlder(file); file.lastModified() }
+        then:
+        skippedTasks.empty
+        originalCacheContents.size() > 0
+
+        expect:
+        withBuildCache().succeeds "clean"
+
+        when:
+        withBuildCache().succeeds "jar", "--rerun-tasks"
+        def updatedCacheContents = listCacheFiles()
+        def updatedModificationTimes = updatedCacheContents*.lastModified()
+        then:
+        nonSkippedTasks.containsAll ":compileJava", ":jar"
+        updatedCacheContents == originalCacheContents
+        originalModificationTimes.size().times { i ->
+            assert originalModificationTimes[i] < updatedModificationTimes[i]
+        }
+    }
+
+    def "task results don't get stored when pushing is disabled"() {
+        settingsFile << """
+            buildCache {
+                local {
+                    push = false
+                }
+            }
+        """
+
+        when:
+        withBuildCache().succeeds "jar"
+        then:
+        skippedTasks.empty
+
+        expect:
+        withBuildCache().succeeds "clean"
+
+        when:
+        withBuildCache().succeeds "jar"
+        then:
+        nonSkippedTasks.containsAll ":compileJava", ":jar"
+    }
+
+    def "task results don't get loaded when pulling is disabled"() {
+        expect:
+        cacheDir.listFiles() as List == []
+
+        when:
+        withBuildCache().succeeds "jar"
+        def originalCacheContents = listCacheFiles()
+        def originalModificationTimes = originalCacheContents.collect { file -> TestFile.makeOlder(file); file.lastModified() }
+        then:
+        skippedTasks.empty
+        originalCacheContents.size() > 0
+
+        expect:
+        withBuildCache().succeeds "clean"
+
+        when:
+        executer.expectDeprecationWarning().withFullDeprecationStackTraceDisabled()
+        withBuildCache().succeeds "jar", "-D${DefaultBuildCacheConfiguration.BUILD_CACHE_CAN_PULL}=false"
+        def updatedCacheContents = listCacheFiles()
+        def updatedModificationTimes = updatedCacheContents*.lastModified()
+        then:
+        nonSkippedTasks.containsAll ":compileJava", ":jar"
+        updatedCacheContents == originalCacheContents
+        originalModificationTimes.size().times { i ->
+            assert originalModificationTimes[i] < updatedModificationTimes[i]
+        }
     }
 
     def "outputs are correctly loaded from cache"() {
@@ -70,162 +197,254 @@ class CachedTaskExecutionIntegrationTest extends AbstractIntegrationSpec {
             apply plugin: "application"
             mainClassName = "Hello"
         """
-        runWithCache "run"
-        runWithCache "clean"
+        withBuildCache().run "run"
+        withBuildCache().run "clean"
         expect:
-        succeedsWithCache "run"
+        withBuildCache().succeeds "run"
     }
 
     def "tasks get cached when source code changes without changing the compiled output"() {
         when:
-        succeedsWithCache "assemble"
+        withBuildCache().succeeds "assemble"
         then:
         skippedTasks.empty
 
         file("src/main/java/Hello.java") << """
             // Change to source file without compiled result change
         """
-        succeedsWithCache "clean"
+        withBuildCache().succeeds "clean"
 
         when:
-        succeedsWithCache "assemble"
+        withBuildCache().succeeds "assemble"
         then:
         nonSkippedTasks.contains ":compileJava"
-        skippedTasks.contains ":jar"
     }
 
     def "tasks get cached when source code changes back to previous state"() {
         expect:
-        succeedsWithCache "jar" assertTaskNotSkipped ":compileJava" assertTaskNotSkipped ":jar"
-
-        println "\n\n\n-----------------------------------------\n\n\n"
+        withBuildCache().succeeds "jar" assertTaskNotSkipped ":compileJava" assertTaskNotSkipped ":jar"
 
         when:
         file("src/main/java/Hello.java").text = CHANGED_HELLO_WORLD
         then:
-        succeedsWithCache "jar" assertTaskNotSkipped ":compileJava" assertTaskNotSkipped ":jar"
-
-        println "\n\n\n-----------------------------------------\n\n\n"
+        withBuildCache().succeeds "jar" assertTaskNotSkipped ":compileJava" assertTaskNotSkipped ":jar"
 
         when:
         file("src/main/java/Hello.java").text = ORIGINAL_HELLO_WORLD
         then:
-        succeedsWithCache "jar"
+        withBuildCache().succeeds "jar"
         result.assertTaskSkipped ":compileJava"
-        result.assertTaskSkipped ":jar"
-    }
-
-    def "jar tasks get cached even when output file is changed"() {
-        file("settings.gradle") << "rootProject.name = 'test'"
-        buildFile << """
-            if (file("toggle.txt").exists()) {
-                jar {
-                    destinationDir = file("\$buildDir/other-jar")
-                    baseName = "other-jar"
-                }
-            }
-        """
-
-        expect:
-        succeedsWithCache "assemble"
-        skippedTasks.empty
-        file("build/libs/test.jar").isFile()
-
-        succeedsWithCache "clean"
-        !file("build/libs/test.jar").isFile()
-
-        file("toggle.txt").touch()
-
-        succeedsWithCache "assemble"
-        skippedTasks.contains ":jar"
-        !file("build/libs/test.jar").isFile()
-        file("build/other-jar/other-jar.jar").isFile()
-    }
-
-    def jarWithContents(Map<String, String> contents) {
-        def out = new ByteArrayOutputStream()
-        def jarOut = new JarOutputStream(out)
-        try {
-            contents.each { file, fileContents ->
-                def zipEntry = new ZipEntry(file)
-                zipEntry.setTime(0)
-                jarOut.putNextEntry(zipEntry)
-                jarOut << fileContents
-            }
-        } finally {
-            jarOut.close()
-        }
-        return out.toByteArray()
     }
 
     def "clean doesn't get cached"() {
-        runWithCache "assemble"
-        runWithCache "clean"
-        runWithCache "assemble"
+        withBuildCache().run "assemble"
+        withBuildCache().run "clean"
+        withBuildCache().run "assemble"
         when:
-        succeedsWithCache "clean"
+        withBuildCache().succeeds "clean"
         then:
         nonSkippedTasks.contains ":clean"
     }
 
-    def "cacheable task with cache disabled doesn't get cached"() {
-        buildFile << """
-            compileJava.outputs.cacheIf { false }
-        """
-
-        runWithCache "compileJava"
-        runWithCache "clean"
+    def "task gets loaded from cache when it is executed from a different directory"() {
+        // Compile Java in a different copy of the project
+        def remoteProjectDir = file("remote-project")
+        setupProjectInDirectory(remoteProjectDir)
 
         when:
-        succeedsWithCache "compileJava"
-        then:
-        // :compileJava is not cached, but :jar is still cached as its inputs haven't changed
-        nonSkippedTasks.contains ":compileJava"
-    }
-
-    def "non-cacheable task with cache enabled gets cached"() {
-        file("input.txt") << "data"
-        buildFile << """
-            class NonCacheableTask extends DefaultTask {
-                @InputFile inputFile
-                @OutputFile outputFile
-
-                @TaskAction copy() {
-                    project.mkdir outputFile.parentFile
-                    outputFile.text = inputFile.text
+        executer.inDirectory(remoteProjectDir)
+        remoteProjectDir.file("settings.gradle") << """
+            buildCache {
+                local(DirectoryBuildCache) {
+                    directory = '${cacheDir.absoluteFile.toURI()}'
                 }
             }
-            task customTask(type: NonCacheableTask) {
-                inputFile = file("input.txt")
-                outputFile = file("\$buildDir/output.txt")
-                outputs.cacheIf { true }
+        """
+        withBuildCache().succeeds "compileJava"
+        then:
+        skippedTasks.empty
+        remoteProjectDir.file("build/classes/main/Hello.class").exists()
+
+        // Remove the project completely
+        remoteProjectDir.deleteDir()
+
+        when:
+        withBuildCache().succeeds "compileJava"
+        then:
+        skippedTasks.containsAll ":compileJava"
+        file("build/classes/main/Hello.class").exists()
+    }
+
+    def "compile task gets loaded from cache when source is moved to another directory"() {
+        def remoteProjectDir = file("remote-project")
+        setupProjectInDirectory(remoteProjectDir, "other-than-main")
+
+        when:
+        executer.inDirectory(remoteProjectDir)
+        remoteProjectDir.file("settings.gradle") << """
+            buildCache {
+                local(DirectoryBuildCache) {
+                    directory = '${cacheDir.absoluteFile.toURI()}'
+                }
             }
-            compileJava.dependsOn customTask
+        """
+        withBuildCache().succeeds "compileJava"
+        then:
+        skippedTasks.empty
+        remoteProjectDir.file("build/classes/main/Hello.class").exists()
+
+        remoteProjectDir.deleteDir()
+
+        when:
+        withBuildCache().succeeds "compileJava"
+        then:
+        skippedTasks.containsAll ":compileJava"
+        file("build/classes/main/Hello.class").exists()
+    }
+
+    @Ignore("Must fix for 4.0")
+    def "using `doNotCacheIf` without reason is deprecated"() {
+        given:
+        buildFile << """
+            task adHocTask {
+                outputs.doNotCacheIf { true }
+            }
         """
 
         when:
-        runWithCache "jar"
+        executer.expectDeprecationWarning()
+        withBuildCache().succeeds 'adHocTask'
+
         then:
-        nonSkippedTasks.contains ":customTask"
+        output.contains "The doNotCacheIf(Spec) method has been deprecated and is scheduled to be removed in Gradle 4.0. Please use the doNotCacheIf(String, Spec) method instead."
+    }
+
+    def "error message contains spec which failed to evaluate"() {
+        given:
+        buildFile << """
+            task adHocTask {
+                inputs.property("input") { true }
+                outputs.file("someFile")
+                outputs.cacheIf("on CI") { throw new RuntimeException() }
+                doLast {
+                    println "Success"
+                }
+            }
+        """
 
         when:
-        runWithCache "clean"
-        succeedsWithCache "jar"
+        withBuildCache().fails 'adHocTask'
+
         then:
-        skippedTasks.contains ":customTask"
+        errorOutput.contains("Could not evaluate spec for 'on CI'.")
     }
 
-    def runWithCache(String... tasks) {
-        enableCache()
-        run tasks
+    @IgnoreIf({GradleContextualExecuter.parallel})
+    def "can load twice from the cache with no changes"() {
+        given:
+        buildFile << """
+            apply plugin: "application"
+            mainClassName = "Hello"
+        """
+
+        when:
+        withBuildCache().run 'clean', 'run'
+
+        then:
+        nonSkippedTasks.contains ':compileJava'
+
+        when:
+        withBuildCache().run 'clean', 'run'
+
+        then:
+        skippedTasks.contains ':compileJava'
+
+        when:
+        withBuildCache().run 'clean', 'run'
+
+        then:
+        skippedTasks.contains ':compileJava'
     }
 
-    def succeedsWithCache(String... tasks) {
-        enableCache()
-        succeeds tasks
+    def "outputs loaded from the cache are snapshotted as outputs"() {
+        buildFile << """ 
+            apply plugin: 'base'
+
+            task createOutput {
+                def outputFile = file('build/output.txt')
+                def inputFile = file('input.txt')
+                inputs.file inputFile
+                inputs.file 'unrelated-input.txt'
+                outputs.file outputFile
+                outputs.cacheIf { true }
+                doLast {
+                    if (!outputFile.exists() || outputFile.text != inputFile.text) {
+                        outputFile.parentFile.mkdirs()
+                        outputFile.text = file('input.txt').text
+                    }
+                }
+            }
+        """.stripIndent()
+
+        def inputFile = file('input.txt')
+        inputFile.text = "input text"
+        def unrelatedInputFile = file('unrelated-input.txt')
+        unrelatedInputFile.text = "not part of the input"
+        def outputFile = file('build/output.txt')
+
+        when:
+        def taskPath = ':createOutput'
+        withBuildCache().succeeds taskPath
+
+        then:
+        nonSkippedTasks.contains taskPath
+        outputFile.text == "input text"
+
+        when:
+        succeeds 'clean'
+        withBuildCache().succeeds taskPath
+
+        then:
+        skippedTasks.contains taskPath
+        outputFile.text == "input text"
+
+        when:
+        unrelatedInputFile.text = "changed input"
+        succeeds taskPath
+
+        then:
+        nonSkippedTasks.contains taskPath
+        outputFile.text == "input text"
+
+        when:
+        outputFile.text = "that should not be the output"
+        succeeds taskPath
+
+        then:
+        // If the output wouldn't have been captured then the task would be up to date
+        nonSkippedTasks.contains taskPath
+        outputFile.text == "input text"
     }
 
-    private GradleExecuter enableCache() {
-        executer.withArguments "-Dorg.gradle.cache.tasks=true", "-Dorg.gradle.cache.tasks.directory=" + cacheDir
+    def "no caching happens when local cache is disabled"() {
+        settingsFile << """
+            buildCache {
+                local {
+                    enabled = false
+                }
+            }
+        """
+        when:
+        withBuildCache().succeeds "jar"
+        then:
+        skippedTasks.empty
+
+        expect:
+        withBuildCache().succeeds "clean"
+
+        when:
+        withBuildCache().succeeds "jar"
+        then:
+        skippedTasks.empty
     }
 }

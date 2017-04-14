@@ -16,7 +16,7 @@
 
 package org.gradle.execution.taskgraph;
 
-import groovy.lang.Closure;
+import org.gradle.api.Action;
 import org.gradle.api.CircularReferenceException;
 import org.gradle.api.Task;
 import org.gradle.api.execution.TaskExecutionGraphListener;
@@ -35,13 +35,19 @@ import org.gradle.api.tasks.TaskOutputs;
 import org.gradle.execution.TaskFailureHandler;
 import org.gradle.initialization.BuildCancellationToken;
 import org.gradle.internal.Factories;
-import org.gradle.internal.TrueTimeProvider;
+import org.gradle.internal.concurrent.ExecutorFactory;
 import org.gradle.internal.event.ListenerBroadcast;
 import org.gradle.internal.event.ListenerManager;
-import org.gradle.internal.operations.DefaultBuildOperationWorkerRegistry;
 import org.gradle.internal.progress.BuildOperationExecutor;
+import org.gradle.internal.progress.TestBuildOperationExecutor;
+import org.gradle.internal.resources.DefaultResourceLockCoordinationService;
+import org.gradle.internal.work.DefaultWorkerLeaseService;
+import org.gradle.internal.resources.ResourceLockCoordinationService;
+import org.gradle.internal.work.WorkerLeaseRegistry;
+import org.gradle.internal.work.WorkerLeaseService;
 import org.gradle.test.fixtures.file.TestNameTestDirectoryProvider;
 import org.gradle.util.JUnit4GroovyMockery;
+import org.gradle.util.Path;
 import org.gradle.util.TestClosure;
 import org.gradle.util.TestUtil;
 import org.hamcrest.Description;
@@ -49,6 +55,7 @@ import org.jmock.Expectations;
 import org.jmock.api.Invocation;
 import org.jmock.integration.junit4.JMock;
 import org.jmock.integration.junit4.JUnit4Mockery;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -67,9 +74,13 @@ import static org.junit.Assert.*;
 public class DefaultTaskGraphExecuterTest {
     final JUnit4Mockery context = new JUnit4GroovyMockery();
     final ListenerManager listenerManager = context.mock(ListenerManager.class);
+    final ResourceLockCoordinationService resourceLockCoordinationService = new DefaultResourceLockCoordinationService();
     final BuildCancellationToken cancellationToken = context.mock(BuildCancellationToken.class);
-    final BuildOperationExecutor buildOperationExecutor = context.mock(BuildOperationExecutor.class);
+    final BuildOperationExecutor buildOperationExecutor = new TestBuildOperationExecutor();
+    final WorkerLeaseService workerLeases = new DefaultWorkerLeaseService(resourceLockCoordinationService, true, 1);
+    private WorkerLeaseRegistry.WorkerLease parentWorkerLease;
     final TaskExecuter executer = context.mock(TaskExecuter.class);
+    final ExecutorFactory executorFactory = context.mock(ExecutorFactory.class);
     DefaultTaskGraphExecuter taskExecuter;
     ProjectInternal root;
     List<Task> executedTasks = new ArrayList<Task>();
@@ -80,17 +91,29 @@ public class DefaultTaskGraphExecuterTest {
     @Before
     public void setUp() {
         root = TestUtil.create(temporaryFolder).rootProject();
+        final InternalTaskExecutionListener taskExecutionListener = context.mock(InternalTaskExecutionListener.class);
         context.checking(new Expectations(){{
             one(listenerManager).createAnonymousBroadcaster(TaskExecutionGraphListener.class);
             will(returnValue(new ListenerBroadcast<TaskExecutionGraphListener>(TaskExecutionGraphListener.class)));
             one(listenerManager).createAnonymousBroadcaster(TaskExecutionListener.class);
             will(returnValue(new ListenerBroadcast<TaskExecutionListener>(TaskExecutionListener.class)));
-            one(listenerManager).createAnonymousBroadcaster(InternalTaskExecutionListener.class);
-            will(returnValue(new ListenerBroadcast<InternalTaskExecutionListener>(InternalTaskExecutionListener.class)));
             allowing(cancellationToken).isCancellationRequested();
-            allowing(buildOperationExecutor).getCurrentOperationId();
+            one(listenerManager).getBroadcaster(InternalTaskExecutionListener.class);
+            will(returnValue(taskExecutionListener));
+            ignoring(taskExecutionListener);
+            allowing(listenerManager);
+            allowing(executorFactory);
         }});
-        taskExecuter = new DefaultTaskGraphExecuter(listenerManager, new DefaultTaskPlanExecutor(new DefaultBuildOperationWorkerRegistry(1)), Factories.constant(executer), cancellationToken, new TrueTimeProvider(), buildOperationExecutor);
+
+        parentWorkerLease = workerLeases.getWorkerLease();
+        resourceLockCoordinationService.withStateLock(DefaultResourceLockCoordinationService.lock(parentWorkerLease));
+        taskExecuter = new DefaultTaskGraphExecuter(listenerManager, new DefaultTaskPlanExecutor(1, executorFactory, workerLeases), Factories.constant(executer), cancellationToken, buildOperationExecutor, workerLeases, resourceLockCoordinationService);
+    }
+
+    @After
+    public void tearDown() {
+        resourceLockCoordinationService.withStateLock(DefaultResourceLockCoordinationService.unlock(parentWorkerLease));
+        workerLeases.stop();
     }
 
     @Test
@@ -284,10 +307,29 @@ public class DefaultTaskGraphExecuterTest {
 
     @Test
     public void testExecutesWhenReadyClosureBeforeExecute() {
+        assertExecutesWhenReadyListenerBeforeExecute(new Action<TestClosure>() {
+            @Override
+            public void execute(TestClosure testClosure) {
+                taskExecuter.whenReady(toClosure(testClosure));
+            }
+        });
+    }
+
+    @Test
+    public void testExecutesWhenReadyActionBeforeExecute() {
+        assertExecutesWhenReadyListenerBeforeExecute(new Action<TestClosure>() {
+            @Override
+            public void execute(TestClosure testClosure) {
+                taskExecuter.whenReady(toAction(testClosure));
+            }
+        });
+    }
+
+    void assertExecutesWhenReadyListenerBeforeExecute(Action<TestClosure> whenReadySubscriber) {
         final TestClosure runnable = context.mock(TestClosure.class);
         Task a = task("a");
 
-        taskExecuter.whenReady(toClosure(runnable));
+        whenReadySubscriber.execute(runnable);
 
         taskExecuter.addTasks(toList(a));
 
@@ -344,13 +386,30 @@ public class DefaultTaskGraphExecuterTest {
 
     @Test
     public void testNotifiesBeforeTaskClosureAsTasksAreExecuted() {
+        assertNotifiesBeforeTaskListenerAsTasksAreExecuted(new Action<TestClosure>() {
+            @Override
+            public void execute(TestClosure testClosure) {
+                taskExecuter.beforeTask(toClosure(testClosure));
+            }
+        });
+    }
+
+    @Test
+    public void testNotifiesBeforeTaskActionAsTasksAreExecuted() {
+        assertNotifiesBeforeTaskListenerAsTasksAreExecuted(new Action<TestClosure>() {
+            @Override
+            public void execute(TestClosure testClosure) {
+                taskExecuter.beforeTask(toAction(testClosure));
+            }
+        });
+    }
+
+    void assertNotifiesBeforeTaskListenerAsTasksAreExecuted(Action<TestClosure> beforeTaskSubscriber) {
         final TestClosure runnable = context.mock(TestClosure.class);
+        beforeTaskSubscriber.execute(runnable);
+
         final Task a = task("a");
         final Task b = task("b");
-
-        final Closure closure = toClosure(runnable);
-        taskExecuter.beforeTask(closure);
-
         taskExecuter.addTasks(toList(a, b));
 
         context.checking(new Expectations() {{
@@ -363,12 +422,30 @@ public class DefaultTaskGraphExecuterTest {
 
     @Test
     public void testNotifiesAfterTaskClosureAsTasksAreExecuted() {
+        assertNotifiesAfterTaskListenerAsTasksAreExecuted(new Action<TestClosure>() {
+            @Override
+            public void execute(TestClosure testClosure) {
+                taskExecuter.afterTask(toClosure(testClosure));
+            }
+        });
+    }
+
+    @Test
+    public void testNotifiesAfterTaskActionAsTasksAreExecuted() {
+        assertNotifiesAfterTaskListenerAsTasksAreExecuted(new Action<TestClosure>() {
+            @Override
+            public void execute(TestClosure testClosure) {
+                taskExecuter.afterTask(toAction(testClosure));
+            }
+        });
+    }
+
+    void assertNotifiesAfterTaskListenerAsTasksAreExecuted(Action<TestClosure> afterTaskSubscriber) {
         final TestClosure runnable = context.mock(TestClosure.class);
+        afterTaskSubscriber.execute(runnable);
+
         final Task a = task("a");
         final Task b = task("b");
-
-        taskExecuter.afterTask(toClosure(runnable));
-
         taskExecuter.addTasks(toList(a, b));
 
         context.checking(new Expectations() {{
@@ -447,6 +524,15 @@ public class DefaultTaskGraphExecuterTest {
         assertThat(executedTasks, equalTo(toList(a, c)));
     }
 
+    static Action toAction(final TestClosure closure) {
+        return new Action() {
+            @Override
+            public void execute(Object o) {
+                closure.call(o);
+            }
+        };
+    }
+
     private void dependsOn(final Task task, final Task... dependsOn) {
         context.checking(new Expectations() {{
             TaskDependency taskDependency = context.mock(TaskDependency.class);
@@ -505,6 +591,8 @@ public class DefaultTaskGraphExecuterTest {
             will(returnValue(name));
             allowing(task).getPath();
             will(returnValue(":" + name));
+            allowing(task).getIdentityPath();
+            will(returnValue(Path.path(":" + name)));
             allowing(task).getState();
             will(returnValue(state));
             allowing((Task) task).getState();
@@ -515,8 +603,6 @@ public class DefaultTaskGraphExecuterTest {
             will(returnValue(new DefaultTaskDependency()));
             allowing(task).getShouldRunAfter();
             will(returnValue(new DefaultTaskDependency()));
-            allowing(task).getDidWork();
-            will(returnValue(true));
             allowing(task).compareTo(with(notNullValue(TaskInternal.class)));
             will(new org.jmock.api.Action() {
                 public Object invoke(Invocation invocation) throws Throwable {

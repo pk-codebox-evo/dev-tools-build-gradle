@@ -20,9 +20,8 @@ import org.gradle.api.internal.TaskExecutionHistory;
 import org.gradle.api.internal.TaskInternal;
 import org.gradle.api.internal.changedetection.TaskArtifactState;
 import org.gradle.api.internal.changedetection.TaskArtifactStateRepository;
-import org.gradle.api.internal.changedetection.state.FilesSnapshotSet;
-import org.gradle.api.internal.tasks.cache.TaskCacheKey;
 import org.gradle.api.tasks.incremental.IncrementalTaskInputs;
+import org.gradle.caching.internal.tasks.TaskOutputCachingBuildCacheKey;
 import org.gradle.internal.reflect.Instantiator;
 
 import java.util.Collection;
@@ -77,12 +76,17 @@ public class ShortCircuitTaskArtifactStateRepository implements TaskArtifactStat
         }
 
         public IncrementalTaskInputs getInputChanges() {
-            return instantiator.newInstance(RebuildIncrementalTaskInputs.class, task, FilesSnapshotSet.EMPTY);
+            return instantiator.newInstance(RebuildIncrementalTaskInputs.class, task);
         }
 
         @Override
-        public TaskCacheKey calculateCacheKey() {
-            return null;
+        public boolean isAllowedToUseCachedResults() {
+            return false;
+        }
+
+        @Override
+        public TaskOutputCachingBuildCacheKey calculateCacheKey() {
+            return delegate.calculateCacheKey();
         }
 
         public TaskExecutionHistory getExecutionHistory() {

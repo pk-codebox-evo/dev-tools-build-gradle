@@ -21,6 +21,10 @@ import org.gradle.api.logging.Logger;
 import org.gradle.api.logging.Logging;
 import org.gradle.api.specs.Spec;
 import org.gradle.internal.Pair;
+import org.gradle.internal.time.CountdownTimer;
+import org.gradle.internal.time.TimeProvider;
+import org.gradle.internal.time.Timers;
+import org.gradle.internal.time.TrueTimeProvider;
 import org.gradle.internal.UncheckedException;
 import org.gradle.internal.logging.progress.ProgressLogger;
 import org.gradle.internal.logging.progress.ProgressLoggerFactory;
@@ -38,6 +42,7 @@ import org.gradle.launcher.daemon.registry.DaemonInfo;
 import org.gradle.launcher.daemon.registry.DaemonRegistry;
 import org.gradle.launcher.daemon.registry.DaemonStopEvent;
 import org.gradle.launcher.daemon.registry.DaemonStopEvents;
+import org.gradle.launcher.daemon.server.api.DaemonStateControl;
 import org.gradle.util.CollectionUtils;
 
 import java.util.Collection;
@@ -45,17 +50,23 @@ import java.util.Date;
 import java.util.LinkedList;
 import java.util.List;
 
+import static java.lang.Thread.sleep;
+import static org.gradle.launcher.daemon.server.api.DaemonStateControl.State.Canceled;
+import static org.gradle.launcher.daemon.server.api.DaemonStateControl.State.Idle;
+
 /**
  * Provides the mechanics of connecting to a daemon, starting one via a given runnable if no suitable daemons are already available.
  */
 public class DefaultDaemonConnector implements DaemonConnector {
     private static final Logger LOGGER = Logging.getLogger(DefaultDaemonConnector.class);
     public static final int DEFAULT_CONNECT_TIMEOUT = 30000;
+    public static final int CANCELED_WAIT_TIMEOUT = 3000;
     private final DaemonRegistry daemonRegistry;
     protected final OutgoingConnector connector;
     private final DaemonStarter daemonStarter;
     private final DaemonStartListener startListener;
     private final ProgressLoggerFactory progressLoggerFactory;
+    private final TimeProvider timeProvider = new TrueTimeProvider();
     private long connectTimeout = DefaultDaemonConnector.DEFAULT_CONNECT_TIMEOUT;
 
     public DefaultDaemonConnector(DaemonRegistry daemonRegistry, OutgoingConnector connector, DaemonStarter daemonStarter, DaemonStartListener startListener, ProgressLoggerFactory progressLoggerFactory) {
@@ -98,16 +109,28 @@ public class DefaultDaemonConnector implements DaemonConnector {
     }
 
     public DaemonClientConnection connect(ExplainingSpec<DaemonContext> constraint) {
-        final Pair<Collection<DaemonInfo>, Collection<DaemonInfo>> idleBusy = partitionByIdleState(daemonRegistry.getAll());
+        final Pair<Collection<DaemonInfo>, Collection<DaemonInfo>> idleBusy = partitionByState(daemonRegistry.getAll(), Idle);
         final Collection<DaemonInfo> idleDaemons = idleBusy.getLeft();
         final Collection<DaemonInfo> busyDaemons = idleBusy.getRight();
 
-        final List<DaemonInfo> compatibleIdleDaemons = getCompatibleDaemons(idleDaemons, constraint);
-        DaemonClientConnection connection = findConnection(compatibleIdleDaemons);
+        // Check to see if there are any compatible idle daemons
+        DaemonClientConnection connection = connectToIdleDaemon(idleDaemons, constraint);
         if (connection != null) {
             return connection;
         }
 
+        // Check to see if there are any compatible canceled daemons and wait to see if one becomes idle
+        connection = connectToCanceledDaemon(busyDaemons, constraint);
+        if (connection != null) {
+            return connection;
+        }
+
+        // No compatible daemons available - start a new daemon
+        handleStopEvents(idleDaemons, busyDaemons);
+        return startDaemon(constraint);
+    }
+
+    private void handleStopEvents(Collection<DaemonInfo> idleDaemons, Collection<DaemonInfo> busyDaemons) {
         final List<DaemonStopEvent> stopEvents = daemonRegistry.getStopEvents();
 
         // Clean up old stop events
@@ -115,18 +138,41 @@ public class DefaultDaemonConnector implements DaemonConnector {
 
         final List<DaemonStopEvent> recentStopEvents = DaemonStopEvents.uniqueRecentDaemonStopEvents(stopEvents);
         for (DaemonStopEvent stopEvent : recentStopEvents) {
-            LOGGER.info("Previous Daemon (" + stopEvent.getPid() + ") stopped at " + stopEvent.getTimestamp() + " " + stopEvent.getReason());
+            Long pid = stopEvent.getPid();
+            LOGGER.info("Previous Daemon (" + (pid == null ? "PID unknown" : pid) + ") stopped at " + stopEvent.getTimestamp() + " " + stopEvent.getReason());
         }
 
         LOGGER.lifecycle(DaemonStartupMessage.generate(busyDaemons.size(), idleDaemons.size(), recentStopEvents.size()));
-
-        return startDaemon(constraint);
     }
 
-    private Pair<Collection<DaemonInfo>, Collection<DaemonInfo>> partitionByIdleState(final Collection<DaemonInfo> daemons) {
+    private DaemonClientConnection connectToIdleDaemon(Collection<DaemonInfo> idleDaemons, ExplainingSpec<DaemonContext> constraint) {
+        final List<DaemonInfo> compatibleIdleDaemons = getCompatibleDaemons(idleDaemons, constraint);
+        return findConnection(compatibleIdleDaemons);
+    }
+
+    private DaemonClientConnection connectToCanceledDaemon(Collection<DaemonInfo> busyDaemons, ExplainingSpec<DaemonContext> constraint) {
+        DaemonClientConnection connection = null;
+        final Pair<Collection<DaemonInfo>, Collection<DaemonInfo>> canceledBusy = partitionByState(busyDaemons, Canceled);
+        final Collection<DaemonInfo> compatibleCanceledDaemons = getCompatibleDaemons(canceledBusy.getLeft(), constraint);
+        if (!compatibleCanceledDaemons.isEmpty()) {
+            LOGGER.info(DaemonMessages.WAITING_ON_CANCELED);
+            CountdownTimer timer = Timers.startTimer(CANCELED_WAIT_TIMEOUT);
+            while (connection == null && !timer.hasExpired()) {
+                try {
+                    sleep(200);
+                    connection = connectToIdleDaemon(daemonRegistry.getIdle(), constraint);
+                } catch (InterruptedException e) {
+                    throw UncheckedException.throwAsUncheckedException(e);
+                }
+            }
+        }
+        return connection;
+    }
+
+    private Pair<Collection<DaemonInfo>, Collection<DaemonInfo>> partitionByState(final Collection<DaemonInfo> daemons, final DaemonStateControl.State state) {
         return CollectionUtils.partition(daemons, new Spec<DaemonInfo>() {
             public boolean isSatisfiedBy(DaemonInfo daemonInfo) {
-                return daemonInfo.isIdle();
+                return daemonInfo.getState() == state;
             }
         });
     }
@@ -161,7 +207,7 @@ public class DefaultDaemonConnector implements DaemonConnector {
             .start("Starting Gradle Daemon", "Starting Daemon");
         final DaemonStartupInfo startupInfo = daemonStarter.startDaemon();
         LOGGER.debug("Started Gradle daemon {}", startupInfo);
-        long expiry = System.currentTimeMillis() + connectTimeout;
+        CountdownTimer timer = Timers.startTimer(connectTimeout);
         try {
             do {
                 DaemonClientConnection daemonConnection = connectToDaemonWithId(startupInfo, constraint);
@@ -170,11 +216,11 @@ public class DefaultDaemonConnector implements DaemonConnector {
                     return daemonConnection;
                 }
                 try {
-                    Thread.sleep(200L);
+                    sleep(200L);
                 } catch (InterruptedException e) {
                     throw UncheckedException.throwAsUncheckedException(e);
                 }
-            } while (System.currentTimeMillis() < expiry);
+            } while (!timer.hasExpired());
         } finally {
             progressLogger.completed();
         }
@@ -184,7 +230,7 @@ public class DefaultDaemonConnector implements DaemonConnector {
 
     private DaemonClientConnection connectToDaemonWithId(DaemonStartupInfo daemon, ExplainingSpec<DaemonContext> constraint) throws ConnectException {
         // Look for 'our' daemon among the busy daemons - a daemon will start in busy state so that nobody else will grab it.
-        for (DaemonInfo daemonInfo : daemonRegistry.getBusy()) {
+        for (DaemonInfo daemonInfo : daemonRegistry.getNotIdle()) {
             if (daemonInfo.getUid().equals(daemon.getUid())) {
                 try {
                     if (!constraint.isSatisfiedBy(daemonInfo.getContext())) {

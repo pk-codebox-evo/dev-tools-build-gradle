@@ -24,10 +24,12 @@ import java.util.Map;
 
 /**
  * Describes an input property of a task that contains zero or more files.
+ *
+ * @since 3.0
  */
 @Incubating
 @HasInternalProtocol
-public interface TaskInputFilePropertyBuilder extends TaskPropertyBuilder, TaskInputs {
+public interface TaskInputFilePropertyBuilder extends TaskFilePropertyBuilder, TaskInputs {
     /**
      * {@inheritDoc}
      */
@@ -57,6 +59,14 @@ public interface TaskInputFilePropertyBuilder extends TaskPropertyBuilder, TaskI
      * specified for the property, but any value specified must meet the validation constraints for the property.
      */
     TaskInputFilePropertyBuilder optional(boolean optional);
+
+    /**
+     * {@inheritDoc}
+     *
+     * @since 3.1
+     */
+    @Override
+    TaskInputFilePropertyBuilder withPathSensitivity(PathSensitivity sensitivity);
 
     /**
      * {@inheritDoc}

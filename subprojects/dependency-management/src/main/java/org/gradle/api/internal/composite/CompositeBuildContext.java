@@ -16,13 +16,26 @@
 
 package org.gradle.api.internal.composite;
 
+import org.gradle.api.Action;
+import org.gradle.api.artifacts.DependencySubstitution;
+import org.gradle.api.artifacts.ModuleVersionIdentifier;
 import org.gradle.api.artifacts.component.ProjectComponentIdentifier;
+import org.gradle.api.internal.artifacts.ivyservice.dependencysubstitution.DependencySubstitutionRules;
 import org.gradle.api.internal.artifacts.ivyservice.projectmodule.LocalComponentProvider;
+import org.gradle.internal.component.local.model.LocalComponentArtifactMetadata;
+import org.gradle.internal.component.local.model.LocalComponentMetadata;
 
 import java.io.File;
 import java.util.Set;
 
-public interface CompositeBuildContext extends LocalComponentProvider {
+public interface CompositeBuildContext extends LocalComponentProvider, DependencySubstitutionRules {
     File getProjectDirectory(ProjectComponentIdentifier project);
     Set<ProjectComponentIdentifier> getAllProjects();
+
+    void registerSubstitution(ModuleVersionIdentifier moduleId, ProjectComponentIdentifier project);
+    void registerSubstitution(Action<DependencySubstitution> substitutions);
+
+    void register(ProjectComponentIdentifier project, LocalComponentMetadata localComponentMetadata, File projectDirectory);
+    void registerAdditionalArtifact(ProjectComponentIdentifier componentIdentifier, LocalComponentArtifactMetadata compositeCopy);
+
 }

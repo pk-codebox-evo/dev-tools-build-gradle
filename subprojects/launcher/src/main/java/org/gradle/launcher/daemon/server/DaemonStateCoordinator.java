@@ -24,11 +24,15 @@ import org.gradle.internal.UncheckedException;
 import org.gradle.internal.concurrent.ExecutorFactory;
 import org.gradle.internal.concurrent.Stoppable;
 import org.gradle.internal.concurrent.StoppableExecutor;
+import org.gradle.internal.time.CountdownTimer;
+import org.gradle.internal.time.TimeProvider;
+import org.gradle.internal.time.Timer;
+import org.gradle.internal.time.Timers;
+import org.gradle.internal.time.TrueTimeProvider;
 import org.gradle.launcher.daemon.server.api.DaemonStateControl;
 import org.gradle.launcher.daemon.server.api.DaemonStoppedException;
 import org.gradle.launcher.daemon.server.api.DaemonUnavailableException;
 
-import java.util.Date;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -46,11 +50,12 @@ public class DaemonStateCoordinator implements Stoppable, DaemonStateControl {
     private static final Logger LOGGER = Logging.getLogger(DaemonStateCoordinator.class);
 
     private final Lock lock = new ReentrantLock();
+    private final TimeProvider timeProvider = new TrueTimeProvider();
     private final Condition condition = lock.newCondition();
     private final long cancelTimeoutMs;
 
     private State state = State.Idle;
-    private long lastActivityAt = -1;
+    private final Timer idleTimer;
     private String currentCommandExecution;
     private Object result;
     private String stopReason;
@@ -59,18 +64,20 @@ public class DaemonStateCoordinator implements Stoppable, DaemonStateControl {
     private final StoppableExecutor executor;
     private final Runnable onStartCommand;
     private final Runnable onFinishCommand;
+    private final Runnable onCancelCommand;
 
-    public DaemonStateCoordinator(ExecutorFactory executorFactory, Runnable onStartCommand, Runnable onFinishCommand) {
-        this(executorFactory, onStartCommand, onFinishCommand, 10 * 1000L);
+    public DaemonStateCoordinator(ExecutorFactory executorFactory, Runnable onStartCommand, Runnable onFinishCommand, Runnable onCancelCommand) {
+        this(executorFactory, onStartCommand, onFinishCommand, onCancelCommand, 10 * 1000L);
     }
 
-    DaemonStateCoordinator(ExecutorFactory executorFactory, Runnable onStartCommand, Runnable onFinishCommand, long cancelTimeoutMs) {
+    DaemonStateCoordinator(ExecutorFactory executorFactory, Runnable onStartCommand, Runnable onFinishCommand, Runnable onCancelCommand, long cancelTimeoutMs) {
         executor = executorFactory.create("Daemon worker");
         this.onStartCommand = onStartCommand;
         this.onFinishCommand = onFinishCommand;
+        this.onCancelCommand = onCancelCommand;
         this.cancelTimeoutMs = cancelTimeoutMs;
-        updateActivityTimestamp();
-        cancellationToken = new DefaultBuildCancellationToken();
+        idleTimer = Timers.startTimer();
+        updateCancellationToken();
     }
 
     private void setState(State state) {
@@ -88,6 +95,10 @@ public class DaemonStateCoordinator implements Stoppable, DaemonStateControl {
                         case Busy:
                             LOGGER.debug("daemon is running. Sleeping until state changes.");
                             condition.await();
+                            break;
+                        case Canceled:
+                            LOGGER.debug("cancel requested.");
+                            cancelNow();
                             break;
                         case Broken:
                             throw new IllegalStateException("This daemon is in a broken state.");
@@ -149,6 +160,7 @@ public class DaemonStateCoordinator implements Stoppable, DaemonStateControl {
             switch (state) {
                 case Idle:
                 case Busy:
+                case Canceled:
                 case Broken:
                 case StopRequested:
                     LOGGER.debug("Marking daemon stopped due to {}. The daemon is running a build: {}", reason, state == State.Busy);
@@ -169,6 +181,7 @@ public class DaemonStateCoordinator implements Stoppable, DaemonStateControl {
         switch (state) {
             case Idle:
             case Busy:
+            case Canceled:
             case Broken:
                 setState(State.StopRequested);
                 break;
@@ -187,12 +200,55 @@ public class DaemonStateCoordinator implements Stoppable, DaemonStateControl {
 
     private void updateCancellationToken() {
         cancellationToken = new DefaultBuildCancellationToken();
+        cancellationToken.addCallback(onCancelCommand);
+    }
+
+    @Override
+    public void requestCancel() {
+        lock.lock();
+        try {
+            if (state == State.Busy) {
+                setState(State.Canceled);
+            } else if (state == State.StopRequested) {
+                requestForcefulStop("the build was canceled after a stop was requested");
+            }
+        } finally {
+            lock.unlock();
+        }
     }
 
     @Override
     public void cancelBuild() {
-        long waitUntil = System.currentTimeMillis() + cancelTimeoutMs;
-        Date expiry = new Date(waitUntil);
+        requestCancel();
+
+        lock.lock();
+        try {
+            while(true) {
+                try {
+                    switch (state) {
+                        case Idle:
+                        case Stopped:
+                            return;
+                        case Busy:
+                        case Canceled:
+                        case StopRequested:
+                            condition.await();
+                            break;
+                        case Broken:
+                            throw new IllegalStateException("This daemon is in a broken state.");
+                    }
+                } catch (InterruptedException e) {
+                    throw UncheckedException.throwAsUncheckedException(e);
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void cancelNow() {
+        CountdownTimer timer = Timers.startTimer(cancelTimeoutMs);
+
         LOGGER.debug("Cancel requested: will wait for daemon to become idle.");
         try {
             cancellationToken.cancel();
@@ -202,16 +258,17 @@ public class DaemonStateCoordinator implements Stoppable, DaemonStateControl {
 
         lock.lock();
         try {
-            while (System.currentTimeMillis() < waitUntil) {
+            while (!timer.hasExpired()) {
                 try {
                     switch (state) {
                         case Idle:
                             LOGGER.debug("Cancel: daemon is idle now.");
                             return;
                         case Busy:
+                        case Canceled:
                         case StopRequested:
                             LOGGER.debug("Cancel: daemon is busy, sleeping until state changes.");
-                            condition.awaitUntil(expiry);
+                            condition.awaitUntil(timer.getExpiryTime());
                             break;
                         case Broken:
                             throw new IllegalStateException("This daemon is in a broken state.");
@@ -224,7 +281,7 @@ public class DaemonStateCoordinator implements Stoppable, DaemonStateControl {
                 }
             }
             LOGGER.debug("Cancel: daemon is still busy after grace period. Will force stop.");
-            stopNow("cancel requested");
+            stopNow("cancel requested but timed out");
         } finally {
             lock.unlock();
         }
@@ -253,7 +310,7 @@ public class DaemonStateCoordinator implements Stoppable, DaemonStateControl {
     private void waitForCommandCompletion() {
         lock.lock();
         try {
-            while ((state == State.Busy || state == State.StopRequested) && result == null) {
+            while ((state == State.Busy || state == State.Canceled || state == State.StopRequested) && result == null) {
                 try {
                     condition.await();
                 } catch (InterruptedException e) {
@@ -311,6 +368,7 @@ public class DaemonStateCoordinator implements Stoppable, DaemonStateControl {
                 case Stopped:
                     throw new DaemonUnavailableException("This daemon has stopped.");
                 case Busy:
+                case Canceled:
                     throw new DaemonUnavailableException(String.format("This daemon is currently executing: %s", currentCommandExecution));
             }
 
@@ -343,6 +401,7 @@ public class DaemonStateCoordinator implements Stoppable, DaemonStateControl {
             switch (state) {
                 case Idle:
                 case Busy:
+                case Canceled:
                     try {
                         onFinishCommand.run();
                         setState(State.Idle);
@@ -365,23 +424,22 @@ public class DaemonStateCoordinator implements Stoppable, DaemonStateControl {
     }
 
     private void updateActivityTimestamp() {
-        long now = System.currentTimeMillis();
-        LOGGER.debug("updating lastActivityAt to {}", now);
-        lastActivityAt = now;
+        LOGGER.debug("resetting idle timer");
+        idleTimer.reset();
     }
 
     private double getIdleMinutes() {
         lock.lock();
         try {
-            return (System.currentTimeMillis() - lastActivityAt) / 1000 / 60;
+            return idleTimer.getElapsedMillis() / 1000 / 60;
         } finally {
             lock.unlock();
         }
     }
 
-    public long getIdleMillis(long currentTimeMillis) {
+    public long getIdleMillis() {
         if (state == State.Idle) {
-            return currentTimeMillis - lastActivityAt;
+            return idleTimer.getElapsedMillis();
         } else {
             return 0L;
         }

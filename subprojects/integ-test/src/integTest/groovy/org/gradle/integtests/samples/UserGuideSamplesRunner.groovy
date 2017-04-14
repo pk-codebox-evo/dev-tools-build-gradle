@@ -18,6 +18,7 @@ package org.gradle.integtests.samples
 import com.google.common.collect.ArrayListMultimap
 import groovy.io.PlatformLineWriter
 import org.apache.tools.ant.taskdefs.Delete
+import org.apache.tools.ant.types.FileSet
 import org.gradle.api.JavaVersion
 import org.gradle.api.Transformer
 import org.gradle.api.reporting.components.JvmComponentReportOutputFormatter
@@ -53,7 +54,7 @@ class UserGuideSamplesRunner extends Runner {
     private TestNameTestDirectoryProvider temporaryFolder = new TestNameTestDirectoryProvider()
     private GradleDistribution dist = new UnderDevelopmentGradleDistribution()
     private IntegrationTestBuildContext buildContext = new IntegrationTestBuildContext()
-    private GradleExecuter executer = new GradleContextualExecuter(dist, temporaryFolder)
+    private GradleExecuter executer = new GradleContextualExecuter(dist, temporaryFolder, buildContext)
     private Pattern dirFilter
     private List excludes
     private TestFile baseExecutionDir = temporaryFolder.testDirectory
@@ -134,8 +135,8 @@ class UserGuideSamplesRunner extends Runner {
             File rootProjectDir = temporaryFolder.testDirectory.file(singleRun.subDir)
             if (rootProjectDir.exists()) {
                 def delete = new Delete()
-                delete.dir = rootProjectDir
-                delete.includes = "**/.gradle/** **/build/**"
+                delete.includeEmptyDirs = true
+                delete.addFileset(new FileSet(dir: rootProjectDir, includes: "**/.gradle/** **/build/**"))
                 AntUtil.execute(delete)
             }
         }
@@ -248,6 +249,12 @@ class UserGuideSamplesRunner extends Runner {
         samplesByDir.get('userguide/tasks/finalizersWithFailure')*.expectFailure = true
         samplesByDir.get('userguide/multiproject/dependencies/firstMessages/messages')*.brokenForParallel = true
         samplesByDir.get('userguide/multiproject/dependencies/messagesHack/messages')*.brokenForParallel = true
+        samplesByDir.get('userguide/tutorial/helloShortcut')*.allowDeprecation = true
+        samplesByDir.get('webApplication/customized')*.allowDeprecation = true
+        samplesByDir.get('webApplication/quickstart')*.allowDeprecation = true
+        samplesByDir.values().findAll() { it.subDir.startsWith('buildCache/') }.each {
+            it.args = ['--build-cache', 'help']
+        }
 
         def java6CrossCompilation = ['java', 'groovy', 'scala'].collectMany {
             samplesByDir.get(it + '/crossCompilation')
@@ -300,7 +307,7 @@ class UserGuideSamplesRunner extends Runner {
 
     private void assertSamplesGenerated(boolean assertion) {
         assert assertion: """Couldn't find any samples. Most likely, samples.xml was not generated.
-Please run 'gradle docs:userguideDocbook' first"""
+Please run 'gradle docs:extractSamples' first"""
     }
 
     private class GradleRun {

@@ -21,37 +21,44 @@ import com.google.common.base.Objects;
 import com.google.common.collect.HashMultiset;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multiset;
+import com.google.common.hash.HashCode;
 import org.gradle.api.Nullable;
-import org.gradle.internal.classloader.ClassLoaderFactory;
+import org.gradle.api.logging.Logger;
+import org.gradle.api.logging.Logging;
 import org.gradle.internal.classloader.ClassLoaderUtils;
-import org.gradle.internal.classloader.ClassPathSnapshot;
-import org.gradle.internal.classloader.ClassPathSnapshotter;
+import org.gradle.internal.classloader.ClasspathHasher;
 import org.gradle.internal.classloader.FilteringClassLoader;
+import org.gradle.internal.classloader.HashingClassLoaderFactory;
 import org.gradle.internal.classpath.ClassPath;
 import org.gradle.internal.concurrent.Stoppable;
 
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 public class DefaultClassLoaderCache implements ClassLoaderCache, Stoppable {
+    private static final Logger LOGGER = Logging.getLogger(DefaultClassLoaderCache.class);
 
     private final Object lock = new Object();
     private final Map<ClassLoaderId, CachedClassLoader> byId = Maps.newHashMap();
     private final Map<ClassLoaderSpec, CachedClassLoader> bySpec = Maps.newHashMap();
-    private final ClassPathSnapshotter snapshotter;
-    private final ClassLoaderFactory classLoaderFactory;
+    private final ClasspathHasher classpathHasher;
+    private final HashingClassLoaderFactory classLoaderFactory;
 
-    public DefaultClassLoaderCache(ClassLoaderFactory classLoaderFactory, ClassPathSnapshotter snapshotter) {
+    public DefaultClassLoaderCache(HashingClassLoaderFactory classLoaderFactory, ClasspathHasher classpathHasher) {
         this.classLoaderFactory = classLoaderFactory;
-        this.snapshotter = snapshotter;
+        this.classpathHasher = classpathHasher;
     }
 
-    public ClassLoader get(ClassLoaderId id, ClassPath classPath, ClassLoader parent, @Nullable FilteringClassLoader.Spec filterSpec) {
-        ClassPathSnapshot classPathSnapshot = snapshotter.snapshot(classPath);
-        ClassLoaderSpec spec = new ClassLoaderSpec(parent, classPathSnapshot, filterSpec);
+    @Override
+    public ClassLoader get(ClassLoaderId id, ClassPath classPath, @Nullable ClassLoader parent, @Nullable FilteringClassLoader.Spec filterSpec) {
+        return get(id, classPath, parent, filterSpec, null);
+    }
+
+    @Override
+    public ClassLoader get(ClassLoaderId id, ClassPath classPath, @Nullable ClassLoader parent, @Nullable FilteringClassLoader.Spec filterSpec, HashCode implementationHash) {
+        if (implementationHash == null) {
+            implementationHash = classpathHasher.hash(classPath);
+        }
+        ManagedClassLoaderSpec spec = new ManagedClassLoaderSpec(parent, classPath, implementationHash, filterSpec);
 
         synchronized (lock) {
             CachedClassLoader cachedLoader = byId.get(id);
@@ -60,6 +67,7 @@ public class DefaultClassLoaderCache implements ClassLoaderCache, Stoppable {
                 byId.put(id, newLoader);
 
                 if (cachedLoader != null) {
+                    LOGGER.debug("Releasing previous classloader for {}", id);
                     cachedLoader.release(id);
                 }
 
@@ -68,6 +76,19 @@ public class DefaultClassLoaderCache implements ClassLoaderCache, Stoppable {
                 return cachedLoader.classLoader;
             }
         }
+    }
+
+    @Override
+    public <T extends ClassLoader> T put(ClassLoaderId id, T classLoader) {
+        synchronized (lock) {
+            remove(id);
+            ClassLoaderSpec spec = new UnmanagedClassLoaderSpec(classLoader);
+            CachedClassLoader cachedClassLoader = new CachedClassLoader(classLoader, spec, null);
+            cachedClassLoader.retain(id);
+            byId.put(id, cachedClassLoader);
+            bySpec.put(spec, cachedClassLoader);
+        }
+        return classLoader;
     }
 
     @Override
@@ -80,7 +101,7 @@ public class DefaultClassLoaderCache implements ClassLoaderCache, Stoppable {
         }
     }
 
-    private CachedClassLoader getAndRetainLoader(ClassPath classPath, ClassLoaderSpec spec, ClassLoaderId id) {
+    private CachedClassLoader getAndRetainLoader(ClassPath classPath, ManagedClassLoaderSpec spec, ClassLoaderId id) {
         CachedClassLoader cachedLoader = bySpec.get(spec);
         if (cachedLoader == null) {
             ClassLoader classLoader;
@@ -89,7 +110,7 @@ public class DefaultClassLoaderCache implements ClassLoaderCache, Stoppable {
                 parentCachedLoader = getAndRetainLoader(classPath, spec.unfiltered(), id);
                 classLoader = classLoaderFactory.createFilteringClassLoader(parentCachedLoader.classLoader, spec.filterSpec);
             } else {
-                classLoader = classLoaderFactory.createClassLoader(spec.parent, classPath);
+                classLoader = classLoaderFactory.createChildClassLoader(spec.parent, classPath, spec.implementationHash);
             }
             cachedLoader = new CachedClassLoader(classLoader, spec, parentCachedLoader);
             bySpec.put(spec, cachedLoader);
@@ -108,80 +129,40 @@ public class DefaultClassLoaderCache implements ClassLoaderCache, Stoppable {
     @Override
     public void stop() {
         synchronized (lock) {
-            for (Map.Entry<ClassLoaderId, CachedClassLoader> entry : sortClassLoadersLeafsFirst()) {
-                ClassLoaderUtils.tryClose(entry.getValue().classLoader);
+            for (CachedClassLoader cachedClassLoader : byId.values()) {
+                ClassLoaderUtils.tryClose(cachedClassLoader.classLoader);
             }
             byId.clear();
             bySpec.clear();
         }
     }
 
-    private List<Map.Entry<ClassLoaderId, CachedClassLoader>> sortClassLoadersLeafsFirst() {
-        /* http://en.wikipedia.org/wiki/Topological_sorting
-         *
-        * L ← Empty list that will contain the sorted nodes
-         S ← Set of all nodes
-
-        function visit(node n)
-            if n has not been visited yet then
-                mark n as visited
-                for each node m with an edge from n to m do
-                    visit(m)
-                add n to L
-
-        for each node n in S do
-            visit(n)
-
-         */
-        List<Map.Entry<ClassLoaderId, CachedClassLoader>> sortedEntries = new ArrayList<Map.Entry<ClassLoaderId, CachedClassLoader>>(byId.size());
-        Set<ClassLoaderId> visitedEntries = new HashSet<ClassLoaderId>();
-
-        for (Map.Entry<ClassLoaderId, CachedClassLoader> entry : byId.entrySet()) {
-            visitTopologicalSort(entry, sortedEntries, visitedEntries);
-        }
-
-        return sortedEntries;
+    private static abstract class ClassLoaderSpec {
     }
 
-    private void visitTopologicalSort(Map.Entry<ClassLoaderId, CachedClassLoader> entry, List<Map.Entry<ClassLoaderId, CachedClassLoader>> sortedEntries, Set<ClassLoaderId> visitedEntries) {
-        if (!visitedEntries.contains(entry.getKey())) {
-            visitedEntries.add(entry.getKey());
-            for (final ClassLoaderId usedBy : entry.getValue().usedBy) {
-                final CachedClassLoader cachedClassLoader = byId.get(usedBy);
-                visitTopologicalSort(new Map.Entry<ClassLoaderId, CachedClassLoader>() {
-                    @Override
-                    public ClassLoaderId getKey() {
-                        return usedBy;
-                    }
+    private static class UnmanagedClassLoaderSpec extends ClassLoaderSpec {
+        private final ClassLoader loader;
 
-                    @Override
-                    public CachedClassLoader getValue() {
-                        return cachedClassLoader;
-                    }
-
-                    @Override
-                    public CachedClassLoader setValue(CachedClassLoader value) {
-                        throw new UnsupportedOperationException();
-                    }
-                }, sortedEntries, visitedEntries);
-            }
-            sortedEntries.add(entry);
+        public UnmanagedClassLoaderSpec(ClassLoader loader) {
+            this.loader = loader;
         }
     }
 
-    private static class ClassLoaderSpec {
+    private static class ManagedClassLoaderSpec extends ClassLoaderSpec {
         private final ClassLoader parent;
-        private final ClassPathSnapshot classPathSnapshot;
+        private final ClassPath classPath;
+        private final HashCode implementationHash;
         private final FilteringClassLoader.Spec filterSpec;
 
-        public ClassLoaderSpec(ClassLoader parent, ClassPathSnapshot classPathSnapshot, FilteringClassLoader.Spec filterSpec) {
+        public ManagedClassLoaderSpec(ClassLoader parent, ClassPath classPath, HashCode implementationHash, FilteringClassLoader.Spec filterSpec) {
             this.parent = parent;
-            this.classPathSnapshot = classPathSnapshot;
+            this.classPath = classPath;
+            this.implementationHash = implementationHash;
             this.filterSpec = filterSpec;
         }
 
-        public ClassLoaderSpec unfiltered() {
-            return new ClassLoaderSpec(parent, classPathSnapshot, null);
+        public ManagedClassLoaderSpec unfiltered() {
+            return new ManagedClassLoaderSpec(parent, classPath, implementationHash, null);
         }
 
         public boolean isFiltered() {
@@ -191,15 +172,17 @@ public class DefaultClassLoaderCache implements ClassLoaderCache, Stoppable {
         @SuppressWarnings("EqualsWhichDoesntCheckParameterClass")
         @Override
         public boolean equals(Object o) {
-            ClassLoaderSpec that = (ClassLoaderSpec) o;
+            ManagedClassLoaderSpec that = (ManagedClassLoaderSpec) o;
             return Objects.equal(this.parent, that.parent)
-                && this.classPathSnapshot.equals(that.classPathSnapshot)
+                && this.implementationHash.equals(that.implementationHash)
+                && this.classPath.equals(that.classPath)
                 && Objects.equal(this.filterSpec, that.filterSpec);
         }
 
         @Override
         public int hashCode() {
-            int result = classPathSnapshot.hashCode();
+            int result = implementationHash.hashCode();
+            result = 31 * result + classPath.hashCode();
             result = 31 * result + (filterSpec != null ? filterSpec.hashCode() : 0);
             result = 31 * result + (parent != null ? parent.hashCode() : 0);
             return result;
@@ -238,15 +221,10 @@ public class DefaultClassLoaderCache implements ClassLoaderCache, Stoppable {
                         parent.release(loaderId);
                     }
                     bySpec.remove(spec);
-                    close();
                 }
             } else {
                 throw new IllegalStateException("Classloader '" + this + "' not used by '" + loaderId + "'");
             }
-        }
-
-        private void close() {
-            ClassLoaderUtils.tryClose(classLoader);
         }
     }
 

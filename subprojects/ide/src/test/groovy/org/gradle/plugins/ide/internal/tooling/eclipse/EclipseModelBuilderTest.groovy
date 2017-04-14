@@ -19,6 +19,7 @@ package org.gradle.plugins.ide.internal.tooling.eclipse
 import org.gradle.api.JavaVersion
 import org.gradle.api.Project
 import org.gradle.api.internal.artifacts.ivyservice.projectmodule.LocalComponentRegistry
+import org.gradle.api.internal.composite.CompositeBuildContext
 import org.gradle.api.plugins.GroovyBasePlugin
 import org.gradle.api.plugins.GroovyPlugin
 import org.gradle.api.plugins.JavaBasePlugin
@@ -36,7 +37,6 @@ import org.gradle.plugins.ide.internal.tooling.GradleProjectBuilder
 import org.gradle.test.fixtures.AbstractProjectBuilderSpec
 import org.gradle.test.fixtures.file.CleanupTestDirectory
 import org.gradle.testfixtures.ProjectBuilder
-import org.gradle.tooling.internal.gradle.DefaultGradleProject
 import org.gradle.util.TestUtil
 import org.gradle.util.UsesNativeServices
 import spock.lang.Unroll
@@ -295,10 +295,10 @@ class EclipseModelBuilderTest extends AbstractProjectBuilderSpec {
     }
 
     private def createEclipseModelBuilder() {
-        def gradleProjectBuilder = Mock(GradleProjectBuilder)
-        gradleProjectBuilder.buildAll(_) >> Mock(DefaultGradleProject)
+        def gradleProjectBuilder = new GradleProjectBuilder()
         def serviceRegistry = new DefaultServiceRegistry()
         serviceRegistry.add(LocalComponentRegistry, Stub(LocalComponentRegistry))
+        serviceRegistry.add(CompositeBuildContext, Stub(CompositeBuildContext))
         new EclipseModelBuilder(gradleProjectBuilder, serviceRegistry)
     }
 }

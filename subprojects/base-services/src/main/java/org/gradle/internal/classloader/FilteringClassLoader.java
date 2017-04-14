@@ -19,7 +19,6 @@ package org.gradle.internal.classloader;
 import org.gradle.internal.reflect.JavaMethod;
 import org.gradle.internal.reflect.JavaReflectionUtil;
 
-import java.io.Closeable;
 import java.io.IOException;
 import java.net.URL;
 import java.util.ArrayList;
@@ -33,9 +32,10 @@ import java.util.Set;
  * A ClassLoader which hides all non-system classes, packages and resources. Allows certain non-system packages and classes to be declared as visible. By default, only the Java system classes,
  * packages and resources are visible.
  */
-public class FilteringClassLoader extends ClassLoader implements ClassLoaderHierarchy, Closeable {
+public class FilteringClassLoader extends ClassLoader implements ClassLoaderHierarchy {
     private static final ClassLoader EXT_CLASS_LOADER;
     private static final Set<String> SYSTEM_PACKAGES = new HashSet<String>();
+    public static final String DEFAULT_PACKAGE = "DEFAULT";
     private final Set<String> packageNames = new HashSet<String>();
     private final Set<String> packagePrefixes = new HashSet<String>();
     private final Set<String> resourcePrefixes = new HashSet<String>();
@@ -45,7 +45,7 @@ public class FilteringClassLoader extends ClassLoader implements ClassLoaderHier
     private final Set<String> disallowedPackagePrefixes = new HashSet<String>();
 
     static {
-        EXT_CLASS_LOADER = ClassLoader.getSystemClassLoader().getParent();
+        EXT_CLASS_LOADER = ClassLoaderUtils.getPlatformClassLoader();
         JavaMethod<ClassLoader, Package[]> method = JavaReflectionUtil.method(ClassLoader.class, Package[].class, "getPackages");
         Package[] systemPackages = method.invoke(EXT_CLASS_LOADER);
         for (Package p : systemPackages) {
@@ -175,13 +175,16 @@ public class FilteringClassLoader extends ClassLoader implements ClassLoaderHier
             if (className.startsWith(packagePrefix)) {
                 return true;
             }
+
+            if (packagePrefix.startsWith(DEFAULT_PACKAGE) && isInDefaultPackage(className)) {
+                return true;
+            }
         }
         return false;
     }
 
-    @Override
-    public void close() throws IOException {
-        ClassLoaderUtils.tryClose(getParent());
+    private boolean isInDefaultPackage(String className) {
+        return !className.contains(".");
     }
 
     public static class Spec extends ClassLoaderSpec {

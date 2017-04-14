@@ -24,6 +24,7 @@ import org.gradle.test.fixtures.maven.MavenFileRepository
 import org.gradle.test.fixtures.plugin.PluginBuilder
 import org.gradle.util.Requires
 import org.gradle.util.TestPrecondition
+import spock.lang.Ignore
 import spock.lang.Issue
 import spock.lang.Shared
 import spock.lang.Unroll
@@ -72,14 +73,16 @@ class ResolvingFromMultipleCustomPluginRepositorySpec extends AbstractDependency
 
     private def use(Repository... repositories) {
         settingsFile << """
-            pluginRepositories {
-                ${repositories.collect {
-                    if (it instanceof MavenFileRepository) {
-                        "maven { url '${it.uri}' }"
-                    } else {
-                        "ivy { url '${it.uri}' }"
-                    }
-                  }.join('\n')}
+            pluginManagement {
+                repositories {
+                    ${repositories.collect {
+                        if (it instanceof MavenFileRepository) {
+                            "maven { url '${it.uri}' }"
+                        } else {
+                            "ivy { url '${it.uri}' }"
+                        }
+                      }.join('\n')}
+                }
             }
         """
     }
@@ -200,33 +203,7 @@ class ResolvingFromMultipleCustomPluginRepositorySpec extends AbstractDependency
         repoType << [IVY, MAVEN]
     }
 
-    def "Prefers Plugin Repositories over buildscript ones."() {
-        given:
-        publishPlugins(MAVEN)
-        buildScript """
-          buildscript {
-              repositories {
-                  maven {
-                      url "${repoA.uri}"
-                  }
-              }
-              dependencies {
-                  classpath "org.example:pluginAB:1.0"
-              }
-          }
-          plugins {
-               id "$pluginAB" version "1.0"
-          }
-        """
-
-        when:
-        use(repoB)
-
-        then:
-        succeeds("pluginAB")
-        output.contains("fetched from $repoB.uri")
-    }
-
+    @Ignore("Must fix for 4.0")
     @Requires(TestPrecondition.ONLINE)
     def "Can opt-in to plugin portal"() {
         given:
@@ -240,9 +217,11 @@ class ResolvingFromMultipleCustomPluginRepositorySpec extends AbstractDependency
 
         when:
         settingsFile << """
-            pluginRepositories {
-                maven {url '${repoA.uri}' }
-                gradlePluginPortal()
+            pluginManagement {
+                repositories {
+                    maven {url '${repoA.uri}' }
+                    gradlePluginPortal()
+                }
             }
         """
 
@@ -271,9 +250,11 @@ class ResolvingFromMultipleCustomPluginRepositorySpec extends AbstractDependency
 
         when:
         settingsFile << """
-            pluginRepositories {
-                maven {url '${repoA.uri}' }
-                gradlePluginPortal()
+            pluginManagement {
+                repositories {
+                    maven {url '${repoA.uri}' }
+                    gradlePluginPortal()
+                }
             }
         """
 

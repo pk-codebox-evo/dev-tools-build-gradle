@@ -16,10 +16,11 @@
 
 package org.gradle.api.internal.changedetection.state;
 
+import com.google.common.base.Objects;
 import com.google.common.hash.HashCode;
-import org.gradle.api.internal.tasks.cache.TaskCacheKeyBuilder;
+import org.gradle.internal.nativeintegration.filesystem.FileType;
 
-class FileHashSnapshot implements IncrementalFileSnapshot, FileSnapshot {
+class FileHashSnapshot implements FileContentSnapshot {
     private final HashCode hash;
     private final transient long lastModified; // Currently not persisted
 
@@ -32,21 +33,38 @@ class FileHashSnapshot implements IncrementalFileSnapshot, FileSnapshot {
         this.lastModified = lastModified;
     }
 
-    public boolean isContentUpToDate(IncrementalFileSnapshot snapshot) {
+    public boolean isContentUpToDate(FileContentSnapshot snapshot) {
         if (!(snapshot instanceof FileHashSnapshot)) {
             return false;
         }
         FileHashSnapshot other = (FileHashSnapshot) snapshot;
-        return hash.equals(other.hash);
+        return Objects.equal(hash, other.hash);
     }
 
     @Override
-    public boolean isContentAndMetadataUpToDate(IncrementalFileSnapshot snapshot) {
+    public boolean isContentAndMetadataUpToDate(FileContentSnapshot snapshot) {
         if (!(snapshot instanceof FileHashSnapshot)) {
             return false;
         }
         FileHashSnapshot other = (FileHashSnapshot) snapshot;
-        return lastModified == other.lastModified && hash.equals(other.hash);
+        return lastModified == other.lastModified && Objects.equal(hash, other.hash);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        FileHashSnapshot that = (FileHashSnapshot) o;
+        return Objects.equal(hash, that.hash);
+    }
+
+    @Override
+    public int hashCode() {
+        return hash.hashCode();
     }
 
     @Override
@@ -55,12 +73,12 @@ class FileHashSnapshot implements IncrementalFileSnapshot, FileSnapshot {
     }
 
     @Override
-    public HashCode getHash() {
-        return hash;
+    public FileType getType() {
+        return FileType.RegularFile;
     }
 
     @Override
-    public void appendToCacheKey(TaskCacheKeyBuilder builder) {
-        builder.putHashCode(hash);
+    public HashCode getContentMd5() {
+        return hash;
     }
 }

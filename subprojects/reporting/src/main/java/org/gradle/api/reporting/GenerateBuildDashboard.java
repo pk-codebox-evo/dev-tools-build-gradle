@@ -36,7 +36,6 @@ import javax.inject.Inject;
 import java.io.File;
 import java.io.Serializable;
 import java.util.Arrays;
-import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Set;
 
@@ -61,7 +60,7 @@ public class GenerateBuildDashboard extends DefaultTask implements Reporting<Bui
 
     @Input
     public Set<ReportState> getInputReports() {
-        Set<ReportState> inputs = new HashSet<ReportState>();
+        Set<ReportState> inputs = new LinkedHashSet<ReportState>();
         for (Report report : getEnabledInputReports()) {
             if (getReports().contains(report)) {
                 // A report to be generated, ignore
@@ -123,12 +122,9 @@ public class GenerateBuildDashboard extends DefaultTask implements Reporting<Bui
      * }
      * </pre>
      *
-     * @deprecated Use {@link #reports(Action)} instead
-     *
      * @param closure The configuration
      * @return The reports container
      */
-    @Deprecated
     public BuildDashboardReports reports(Closure closure) {
         return reports(new ClosureBackedAction<BuildDashboardReports>(closure));
     }

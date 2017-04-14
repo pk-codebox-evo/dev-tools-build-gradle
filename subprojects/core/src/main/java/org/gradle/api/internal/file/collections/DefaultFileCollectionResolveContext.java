@@ -27,6 +27,7 @@ import org.gradle.api.tasks.util.PatternSet;
 import org.gradle.internal.Cast;
 import org.gradle.internal.Factory;
 import org.gradle.internal.file.PathToFileResolver;
+import org.gradle.internal.nativeintegration.services.FileSystems;
 import org.gradle.util.GUtil;
 
 import java.io.File;
@@ -43,14 +44,14 @@ public class DefaultFileCollectionResolveContext implements ResolvableFileCollec
     protected final PathToFileResolver fileResolver;
     private final List<Object> queue = new LinkedList<Object>();
     private List<Object> addTo = queue;
-    protected final Converter<? extends FileCollectionInternal> fileCollectionConverter;
-    protected final Converter<? extends FileTreeInternal> fileTreeConverter;
+    private final Converter<? extends FileCollectionInternal> fileCollectionConverter;
+    private final Converter<? extends FileTreeInternal> fileTreeConverter;
 
     public DefaultFileCollectionResolveContext(FileResolver fileResolver) {
         this(fileResolver, new FileCollectionConverter(), new FileTreeConverter(fileResolver.getPatternSetFactory()));
     }
 
-    protected DefaultFileCollectionResolveContext(PathToFileResolver fileResolver, Converter<? extends FileCollectionInternal> fileCollectionConverter, Converter<? extends FileTreeInternal> fileTreeConverter) {
+    private DefaultFileCollectionResolveContext(PathToFileResolver fileResolver, Converter<? extends FileCollectionInternal> fileCollectionConverter, Converter<? extends FileTreeInternal> fileTreeConverter) {
         this.fileResolver = fileResolver;
         this.fileCollectionConverter = fileCollectionConverter;
         this.fileTreeConverter = fileTreeConverter;
@@ -214,7 +215,7 @@ public class DefaultFileCollectionResolveContext implements ResolvableFileCollec
 
         private void convertFileToFileTree(File file, Collection<? super FileTreeInternal> result) {
             if (file.isDirectory()) {
-                result.add(new FileTreeAdapter(new DirectoryFileTree(file, patternSetFactory.create())));
+                result.add(new FileTreeAdapter(new DirectoryFileTree(file, patternSetFactory.create(), FileSystems.getDefault())));
             } else if (file.isFile()) {
                 result.add(new FileTreeAdapter(new SingletonFileTree(file)));
             }
